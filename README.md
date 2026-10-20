@@ -82,6 +82,29 @@ Historical tick files are intentionally excluded from Git. Keep data in a
 versioned object store or dataset registry and record its immutable identifier
 and checksum alongside each backtest report.
 
+## Grid optimization
+
+`mt5_grid_optimizer.py` reads a tick CSV/Parquet file through the Backtrader
+engine, evaluates fast SMA values 5–20 and slow SMA values 30–100 by default,
+and writes per-pair train/holdout metrics to `backtest_results/grid_search.csv`.
+Set the pip/tick economics, commission schedule, slippage, and latency from the
+actual instrument/account before comparing runs. Example:
+
+```sh
+python mt5_grid_optimizer.py /path/to/EURUSD_ticks.csv \
+  --symbol EURUSD --pip-size 0.0001 --tick-size 0.00001 \
+  --tick-value-loss 1.0 --fee-per-lot-side 3.5
+```
+
+The tool ranks candidates on the training partition using
+`Sharpe + log(1 + Profit Factor) - 2 * Maximum Drawdown` and validates the
+single training winner on the later holdout. It writes fast/slow periods to
+`config/strategy_params.json` only if that winner also has positive holdout
+return, Profit Factor above 1, positive Sharpe, and at least five closed trades.
+Use `--no-write-config` to inspect a run without changing the active file.
+`MT5StrategyEngine.from_config(...)` loads the resulting parameters. Review the
+config diff and commit it to preserve or roll back a chosen parameter set.
+
 ## System diagnostics
 
 Run `python sys_diagnostics.py` to check Telegram `sendMessage`, Slack

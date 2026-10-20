@@ -8,10 +8,12 @@ completed candles directly through :meth:`on_candle_close`.
 from __future__ import annotations
 
 import logging
+import json
 import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from mt5_position_sizing import calculate_atr_position_size
@@ -125,6 +127,42 @@ class MT5StrategyEngine:
         self._previous_feed_callback: Optional[Callable[[dict[str, Any]], None]] = None
         self.last_signal: Optional[Signal] = None
         self.last_order_state: Any = None
+
+    @classmethod
+    def from_config(cls, mt5_module: Any, market_data: Any, oms: Any,
+                    risk_engine: Any, config_path: str | Path, **overrides: Any
+                    ) -> "MT5StrategyEngine":
+        """Construct the engine from tracked ``config/strategy_params.json``.
+
+        Explicit keyword overrides take precedence over file values.
+        Optimization metadata stored by the grid-search tool is ignored.
+        """
+        path = Path(config_path)
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError(f"Strategy config not found: {path}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid strategy config JSON at line {exc.lineno}") from exc
+        if not isinstance(config, dict):
+            raise ValueError("Strategy config must be a JSON object")
+        values = {
+            "strategy_id": config.get("strategy_id"),
+            "magic": config.get("magic"),
+            "symbol": config.get("symbol"),
+            "timeframe_minutes": config.get("timeframe_minutes", 15),
+            "fast_period": config.get("fast_period", 10),
+            "slow_period": config.get("slow_period", 30),
+            "risk_fraction": config.get("risk_fraction", 0.01),
+            "atr_period": config.get("atr_period", 14),
+            "atr_multiple": config.get("atr_multiple", 1.0),
+            "deviation": config.get("deviation_points", 10),
+        }
+        values.update(overrides)
+        missing = [name for name in ("strategy_id", "magic", "symbol") if values.get(name) is None]
+        if missing:
+            raise ValueError(f"Missing required strategy config fields: {', '.join(missing)}")
+        return cls(mt5_module, market_data, oms, risk_engine, **values)
 
     def attach(self) -> None:
         """Route events from the Step 1 feed into this engine.

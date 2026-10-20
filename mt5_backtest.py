@@ -50,6 +50,7 @@ class BacktestConfig:
     volume_step: float = 0.01
     fast_period: int = 10
     slow_period: int = 30
+    bars_per_year: int = 252 * 24 * 4
 
 
 class TickData(bt.feeds.PandasData):
@@ -95,6 +96,8 @@ class TickMACross(bt.Strategy):
         self.pending_entry_side: Optional[str] = None
         self.closed_trades = 0
         self.equity: list[float] = []
+        self.equity_samples: list[float] = []
+        self.closed_trade_pnls: list[float] = []
         self._last_side: Optional[str] = None
 
     def next(self) -> None:
@@ -116,6 +119,9 @@ class TickMACross(bt.Strategy):
             self.candle = {"time": bucket, "open": price, "high": price,
                            "low": price, "close": price}
             self._on_candle_close(completed)
+            self._dispatch_delayed(stamp, price)
+            self.equity_samples.append(float(self.broker.getvalue()))
+            return
 
         self._dispatch_delayed(stamp, price)
 
@@ -198,12 +204,20 @@ class TickMACross(bt.Strategy):
                 self.pending_stop = None
             elif self.stop_order is order:
                 self.stop_order = None
-            if not self.position:
-                self.closed_trades += 1
         elif order.status in (order.Canceled, order.Margin, order.Rejected, order.Expired):
             self.pending_stop = None
         if order is self.order:
             self.order = None
+
+    def notify_trade(self, trade: Any) -> None:
+        if trade.isclosed:
+            self.closed_trades += 1
+            self.closed_trade_pnls.append(float(trade.pnlcomm))
+
+    def stop(self) -> None:
+        final_value = float(self.broker.getvalue())
+        if not self.equity_samples or self.equity_samples[-1] != final_value:
+            self.equity_samples.append(final_value)
 
     def _atr(self) -> float:
         period = self.cfg.atr_period
@@ -236,7 +250,7 @@ def load_ticks(path: str | Path, *, timestamp_col: str = "time") -> pd.DataFrame
         raw = pd.read_csv(path)
     if timestamp_col not in raw.columns:
         raise ValueError(f"Missing timestamp column {timestamp_col!r}")
-    raw[timestamp_col] = pd.to_datetime(raw[timestamp_col], utc=True, errors="coerce")
+    raw[timestamp_col] = _parse_tick_times(raw[timestamp_col], timestamp_col)
     raw = raw.dropna(subset=[timestamp_col]).sort_values(timestamp_col)
     if {"bid", "ask"}.issubset(raw.columns):
         raw["close"] = (pd.to_numeric(raw["bid"], errors="coerce")
@@ -293,11 +307,25 @@ def run_backtest(data: pd.DataFrame, config: BacktestConfig) -> dict[str, Any]:
         final_equity = float(equity[-1])
     else:
         max_dd, final_equity = 0.0, config.initial_cash
+    trade_pnls = np.asarray(strat.closed_trade_pnls, dtype=float)
+    gains = float(trade_pnls[trade_pnls > 0].sum()) if len(trade_pnls) else 0.0
+    losses = float(-trade_pnls[trade_pnls < 0].sum()) if len(trade_pnls) else 0.0
+    profit_factor = gains / losses if losses > 0 else (float("inf") if gains > 0 else 0.0)
+    sampled = np.asarray(strat.equity_samples, dtype=float)
+    if len(sampled) > 1:
+        returns = np.diff(sampled) / sampled[:-1]
+        std = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+        sharpe = (float(np.mean(returns)) / std * math.sqrt(config.bars_per_year)
+                  if std > 0 else 0.0)
+    else:
+        sharpe = 0.0
     return {
         "initial_cash": config.initial_cash,
         "final_equity": final_equity,
         "total_return": final_equity / config.initial_cash - 1.0,
         "max_drawdown": max_dd,
+        "profit_factor": profit_factor,
+        "sharpe_ratio": sharpe,
         "closed_trades": int(strat.closed_trades),
         "fast_period": config.fast_period,
         "slow_period": config.slow_period,
@@ -408,6 +436,17 @@ def _with_params(base: BacktestConfig, fast: int, slow: int) -> BacktestConfig:
     values = asdict(base)
     values.update(fast_period=int(fast), slow_period=int(slow))
     return BacktestConfig(**values)
+
+
+def _parse_tick_times(values: pd.Series, column_name: str) -> pd.Series:
+    """Parse ISO timestamps or MT5 epoch seconds/milliseconds as UTC."""
+    if pd.api.types.is_numeric_dtype(values.dtype):
+        non_null = pd.to_numeric(values, errors="coerce").dropna()
+        if non_null.empty:
+            return pd.to_datetime(values, utc=True, errors="coerce")
+        unit = "ms" if "msc" in column_name.lower() or float(non_null.median()) > 1e11 else "s"
+        return pd.to_datetime(values, unit=unit, utc=True, errors="coerce")
+    return pd.to_datetime(values, utc=True, errors="coerce")
 
 
 def main() -> None:
