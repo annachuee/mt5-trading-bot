@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "strategy_id": "ma_cross_m15",
+  "symbol": "EURUSD",
+  "magic": 1001,
+  "timeframe_minutes": 15,
+  "fast_period": 10,
+  "slow_period": 30,
+  "risk_fraction": 0.01,
+  "atr_period": 14,
+  "atr_multiple": 1.0,
+  "deviation_points": 10
+}
