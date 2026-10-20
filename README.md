@@ -82,6 +82,32 @@ Historical tick files are intentionally excluded from Git. Keep data in a
 versioned object store or dataset registry and record its immutable identifier
 and checksum alongside each backtest report.
 
+## Windows production deployment
+
+`mt5_production.py` is the Windows live-process entry point. It loads secrets
+from a local `.env` using `python-dotenv`, connects the terminal, starts the
+market-data collector, the 200 ms risk monitor, and the configured strategy
+engine. Market execution is routed through the IOC-only OMS. The runner does
+not log credential values. `TRADING_ENABLED=true` is required before any
+orders can be sent, and `REQUIRE_OPTIMIZED_CONFIG=true` requires a config with
+passing holdout metadata. The current sample config has not passed holdout
+validation, so the default production launch intentionally stops until a
+qualified configuration is committed.
+
+On the Windows host, install 64-bit Python and MetaTrader 5, copy
+`.env.example` to `.env`, set the terminal/account values and daily loss limit,
+review the strategy config, then run `run_production.bat`. Keep `.env` access
+restricted to the service account and operators; do not copy it into the ZIP.
+The batch file creates a local virtual environment and installs the Windows
+MetaTrader5 package alongside the shared Python requirements.
+
+From a clean, committed Git checkout, run `python build_release.py`. The script
+generates `run_production.bat`, requires a clean tree, packages tracked source
+into `dist/mt5-platform-release-<commit>.zip`, and writes a release manifest.
+It excludes `.env` secrets, logs, tick CSVs, local data, and runtime folders.
+The manifest records the commit and active strategy settings without including
+credentials.
+
 ## Extracting EURUSD ticks on Windows
 
 Run `extract_ticks.py` on the Windows host where the logged-in MT5 terminal is

@@ -241,6 +241,113 @@ class TickMACross(bt.Strategy):
         return round(volume, max(0, len(f"{cfg.volume_step:.12f}".rstrip("0").partition(".")[2])))
 
 
+class CandleMACross(bt.Strategy):
+    """M15 execution path for grid search, preserving the strategy's candle logic.
+
+    The optimizer pre-aggregates raw ticks into M15 OHLC bars. Market orders
+    execute at the first original tick after the next candle boundary plus the
+    configured latency. Stops use Backtrader's OHLC stop execution semantics.
+    """
+    params = (("config", None), ("fast_period", 10), ("slow_period", 30))
+
+    def __init__(self) -> None:
+        self.cfg: BacktestConfig = self.p.config
+        self.closes: list[float] = []
+        self.ranges: list[tuple[float, float, float]] = []
+        self.order: Any = None
+        self.stop_order: Any = None
+        self.pending_stop: Optional[tuple[str, float]] = None
+        self.closed_trades = 0
+        self.equity: list[float] = []
+        self.equity_samples: list[float] = []
+        self.closed_trade_pnls: list[float] = []
+        self._last_side: Optional[str] = None
+
+    def next(self) -> None:
+        close = float(self.data.close[0])
+        self.closes.append(close)
+        self.ranges.append((float(self.data.high[0]), float(self.data.low[0]), close))
+        self.equity.append(float(self.broker.getvalue()))
+        self.equity_samples.append(float(self.broker.getvalue()))
+        if self.order is not None or len(self.closes) < max(
+            self.p.slow_period + 1, self.cfg.atr_period + 1
+        ):
+            return
+        fast_now = float(np.mean(self.closes[-self.p.fast_period:]))
+        slow_now = float(np.mean(self.closes[-self.p.slow_period:]))
+        fast_prev = float(np.mean(self.closes[-self.p.fast_period - 1:-1]))
+        slow_prev = float(np.mean(self.closes[-self.p.slow_period - 1:-1]))
+        side = None
+        if fast_prev <= slow_prev and fast_now > slow_now:
+            side = "buy"
+        elif fast_prev >= slow_prev and fast_now < slow_now:
+            side = "sell"
+        if side is None or side == self._last_side:
+            return
+        self._last_side = side
+        atr = self._atr()
+        if atr <= 0 or not math.isfinite(atr):
+            return
+        if self.position:
+            if self.stop_order is not None:
+                self.cancel(self.stop_order)
+                self.stop_order = None
+            self.order = self.close()
+            return
+        loss_per_lot = (atr * self.cfg.atr_multiple / self.cfg.tick_size) * self.cfg.tick_value_loss
+        raw_size = max(0.0, float(self.broker.getvalue()) * self.cfg.risk_fraction) / loss_per_lot
+        size = self._quantize_size(raw_size)
+        if size <= 0:
+            return
+        self.pending_stop = (side, close - atr * self.cfg.atr_multiple
+                             if side == "buy" else close + atr * self.cfg.atr_multiple)
+        self.order = self.buy(size=size) if side == "buy" else self.sell(size=size)
+
+    def notify_order(self, order: Any) -> None:
+        if order.status in (order.Submitted, order.Accepted, order.Partial):
+            return
+        if order.status == order.Completed:
+            if self.pending_stop is not None and order.isbuy() == (self.pending_stop[0] == "buy"):
+                side, stop_price = self.pending_stop
+                if side == "buy":
+                    self.stop_order = self.sell(size=abs(order.executed.size),
+                                                exectype=bt.Order.Stop, price=stop_price)
+                else:
+                    self.stop_order = self.buy(size=abs(order.executed.size),
+                                               exectype=bt.Order.Stop, price=stop_price)
+                self.pending_stop = None
+            elif self.stop_order is order:
+                self.stop_order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected, order.Expired):
+            self.pending_stop = None
+        if order is self.order:
+            self.order = None
+
+    def notify_trade(self, trade: Any) -> None:
+        if trade.isclosed:
+            self.closed_trades += 1
+            self.closed_trade_pnls.append(float(trade.pnlcomm))
+
+    def _atr(self) -> float:
+        period = self.cfg.atr_period
+        sample = self.ranges[-(period + 1):]
+        trs = [max(sample[i][0] - sample[i][1],
+                   abs(sample[i][0] - sample[i - 1][2]),
+                   abs(sample[i][1] - sample[i - 1][2]))
+               for i in range(1, len(sample))]
+        return float(np.mean(trs[-period:])) if len(trs) >= period else 0.0
+
+    def _quantize_size(self, raw: float) -> float:
+        cfg = self.cfg
+        if raw < cfg.volume_min:
+            return 0.0
+        capped = min(raw, cfg.volume_max)
+        steps = math.floor((capped - cfg.volume_min + cfg.volume_step * 1e-10)
+                           / cfg.volume_step)
+        return round(cfg.volume_min + steps * cfg.volume_step,
+                     max(0, len(f"{cfg.volume_step:.12f}".rstrip("0").partition(".")[2])))
+
+
 def load_ticks(path: str | Path, *, timestamp_col: str = "time") -> pd.DataFrame:
     """Load and normalize historical tick CSV/Parquet into Backtrader rows."""
     path = Path(path)
@@ -248,6 +355,8 @@ def load_ticks(path: str | Path, *, timestamp_col: str = "time") -> pd.DataFrame
         raw = pd.read_parquet(path)
     else:
         raw = pd.read_csv(path)
+    if timestamp_col not in raw.columns and timestamp_col == "time" and "timestamp" in raw.columns:
+        timestamp_col = "timestamp"
     if timestamp_col not in raw.columns:
         raise ValueError(f"Missing timestamp column {timestamp_col!r}")
     raw[timestamp_col] = _parse_tick_times(raw[timestamp_col], timestamp_col)
@@ -330,6 +439,83 @@ def run_backtest(data: pd.DataFrame, config: BacktestConfig) -> dict[str, Any]:
         "fast_period": config.fast_period,
         "slow_period": config.slow_period,
         "latency_ms": config.latency_ms,
+        "slippage_pips": config.slippage_pips,
+        "commission_per_lot_side": config.fee_per_lot_side,
+    }
+
+
+def aggregate_ticks_for_m15(ticks: pd.DataFrame, config: BacktestConfig) -> pd.DataFrame:
+    """Aggregate ticks to M15 candles while keeping first post-latency tick opens."""
+    if ticks.empty:
+        raise ValueError("Cannot aggregate an empty tick split")
+    frame = ticks[["close", "volume"]].copy()
+    frame["price"] = frame["close"].astype(float)
+    frequency = f"{config.timeframe_minutes}min"
+    grouped = frame["price"].resample(frequency, label="left", closed="left")
+    bars = grouped.ohlc().dropna()
+    bars.columns = ["open", "high", "low", "close"]
+    bars["volume"] = frame["volume"].resample(frequency, label="left", closed="left").sum()
+    latency = pd.Timedelta(milliseconds=config.latency_ms)
+    tick_ns = ticks.index.asi8
+    mid_values = ticks["close"].to_numpy(dtype=float)
+    fill_prices: list[float] = []
+    keep: list[bool] = []
+    for bucket in bars.index:
+        target = bucket + pd.Timedelta(minutes=config.timeframe_minutes) + latency
+        loc = int(tick_ns.searchsorted(target.value, side="left"))
+        if loc < len(mid_values):
+            fill_prices.append(float(mid_values[loc]))
+            keep.append(True)
+        else:
+            fill_prices.append(float("nan"))
+            keep.append(False)
+    bars["open"] = fill_prices
+    bars = bars.loc[keep]
+    return bars.dropna()
+
+
+def run_candle_backtest(data: pd.DataFrame, config: BacktestConfig) -> dict[str, Any]:
+    """Fast M15 backtest using tick-derived OHLC and tick-resolved entry opens."""
+    if len(data) < max(config.slow_period, config.atr_period) * 4:
+        raise ValueError("Not enough M15 candles for requested lookbacks")
+    cerebro = bt.Cerebro(stdstats=False)
+    cerebro.adddata(TickData(dataname=data))
+    cerebro.addstrategy(CandleMACross, config=config,
+                        fast_period=config.fast_period, slow_period=config.slow_period)
+    cerebro.broker.setcash(config.initial_cash)
+    cerebro.broker.set_slippage_fixed(
+        fixed=config.slippage_pips * config.pip_size,
+        slip_open=True, slip_limit=True, slip_match=True, slip_out=False,
+    )
+    cerebro.broker.addcommissioninfo(VenueCommission(
+        per_lot_side=config.fee_per_lot_side,
+        fixed_per_order=config.fixed_fee_per_order,
+    ))
+    strat = cerebro.run()[0]
+    equity = np.asarray(strat.equity, dtype=float)
+    if len(equity):
+        peaks = np.maximum.accumulate(equity)
+        drawdowns = np.divide(peaks - equity, peaks, out=np.zeros_like(equity), where=peaks != 0)
+        max_dd, final_equity = float(np.max(drawdowns)), float(equity[-1])
+    else:
+        max_dd, final_equity = 0.0, config.initial_cash
+    pnls = np.asarray(strat.closed_trade_pnls, dtype=float)
+    gains = float(pnls[pnls > 0].sum()) if len(pnls) else 0.0
+    losses = float(-pnls[pnls < 0].sum()) if len(pnls) else 0.0
+    pf = gains / losses if losses > 0 else (float("inf") if gains > 0 else 0.0)
+    sampled = np.asarray(strat.equity_samples, dtype=float)
+    if len(sampled) > 1:
+        returns = np.diff(sampled) / sampled[:-1]
+        std = float(np.std(returns, ddof=1))
+        sharpe = float(np.mean(returns) / std * math.sqrt(config.bars_per_year)) if std > 0 else 0.0
+    else:
+        sharpe = 0.0
+    return {
+        "initial_cash": config.initial_cash, "final_equity": final_equity,
+        "total_return": final_equity / config.initial_cash - 1.0,
+        "max_drawdown": max_dd, "profit_factor": pf, "sharpe_ratio": sharpe,
+        "closed_trades": int(strat.closed_trades), "fast_period": config.fast_period,
+        "slow_period": config.slow_period, "latency_ms": config.latency_ms,
         "slippage_pips": config.slippage_pips,
         "commission_per_lot_side": config.fee_per_lot_side,
     }

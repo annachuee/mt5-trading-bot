@@ -26,7 +26,9 @@ from typing import Any, Optional
 
 import pandas as pd
 
-from mt5_backtest import BacktestConfig, load_ticks, run_backtest
+from mt5_backtest import (
+    BacktestConfig, aggregate_ticks_for_m15, load_ticks, run_candle_backtest,
+)
 
 
 def grid_search(
@@ -58,6 +60,29 @@ def grid_search(
         raise ValueError("Training split is too small for the requested MA lookbacks")
     if len(holdout) < max(base.atr_period, slow_min) * 4:
         raise ValueError("Holdout split is too small for the requested MA lookbacks")
+    train_candles = train.index.floor(f"{base.timeframe_minutes}min").nunique()
+    holdout_candles = holdout.index.floor(f"{base.timeframe_minutes}min").nunique()
+    minimum_signal_candles = slow_min + 1
+    if train_candles < minimum_signal_candles or holdout_candles < minimum_signal_candles:
+        raise ValueError(
+            "Insufficient completed M15 candles for SMA crossover validation: "
+            f"training has {train_candles}, holdout has {holdout_candles}; at least "
+            f"{minimum_signal_candles} candles are needed in each split for the "
+            f"minimum slow MA ({slow_min}). Add a longer tick history or use a "
+            "larger tick sample before optimizing."
+        )
+
+    # The strategy only makes decisions on completed M15 candles. Aggregate
+    # once per split (rather than replaying 1.5m identical intra-candle ticks
+    # for each candidate); entry opens still come from the first raw tick after
+    # each candle boundary plus the configured latency.
+    train_bars = aggregate_ticks_for_m15(train, base)
+    holdout_bars = aggregate_ticks_for_m15(holdout, base)
+    print(
+        f"Prepared M15 execution bars from raw ticks: train={len(train_bars):,}, "
+        f"holdout={len(holdout_bars):,}; entries use first post-latency raw tick",
+        flush=True,
+    )
 
     fast_values = range(fast_min, fast_max + 1, fast_step)
     slow_values = range(slow_min, slow_max + 1, slow_step)
@@ -69,13 +94,14 @@ def grid_search(
     best_train: Optional[dict[str, Any]] = None
     for index, (fast, slow) in enumerate(pairs, 1):
         cfg = _config_with_ma(base, fast, slow)
-        train_result = run_backtest(train, cfg)
-        holdout_result = run_backtest(holdout, cfg)
+        train_result = run_candle_backtest(train_bars, cfg)
+        holdout_result = run_candle_backtest(holdout_bars, cfg)
         train_score = risk_adjusted_score(train_result)
         holdout_score = risk_adjusted_score(holdout_result)
         record = {
             "fast_period": fast,
             "slow_period": slow,
+            "simulation_resolution": "M15 OHLC; entry from first post-latency source tick",
             "train_return": train_result["total_return"],
             "train_profit_factor": train_result["profit_factor"],
             "train_max_drawdown": train_result["max_drawdown"],
@@ -255,7 +281,7 @@ def main() -> int:
     metrics.to_csv(args.results, index=False)
     print(f"Saved {len(metrics)} parameter results to {args.results}")
     if not selected:
-    print("Top training candidate failed holdout qualification; active config was not changed.")
+        print("Top training candidate failed holdout qualification; active config was not changed.")
         return 2
 
     print("Selected holdout parameters:")
