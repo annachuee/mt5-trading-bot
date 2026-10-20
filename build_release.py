@@ -141,7 +141,10 @@ def build_release() -> Path:
                 if member.isfile() and member.name in included:
                     content = source.extractfile(member)
                     if content is not None:
-                        bundle.writestr(member.name, content.read())
+                        payload = content.read()
+                        if member.name.lower().endswith(".bat"):
+                            payload = payload.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                        bundle.writestr(member.name, payload)
             bundle.writestr("release_manifest.json", json.dumps(manifest, indent=2) + "\n")
 
     with zipfile.ZipFile(output) as bundle:
