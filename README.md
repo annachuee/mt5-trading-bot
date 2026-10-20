@@ -88,11 +88,14 @@ and checksum alongside each backtest report.
 from a local `.env` using `python-dotenv`, connects the terminal, starts the
 market-data collector, the 200 ms risk monitor, and the configured strategy
 engine. Market execution is routed through the IOC-only OMS. The runner does
-not log credential values. `TRADING_ENABLED=true` is required before any
-orders can be sent, and `REQUIRE_OPTIMIZED_CONFIG=true` requires a config with
+not log credential values. With `TRADING_ENABLED=false`, it starts the feed and
+risk monitor and uses an OMS-compatible sink that logs and suppresses every
+order. Live submission defaults to requiring a DEMO account and a config with
 passing holdout metadata. The current sample config has not passed holdout
-validation, so the default production launch intentionally stops until a
-qualified configuration is committed.
+validation, so live mode requires `REQUIRE_OPTIMIZED_CONFIG=true` and stops
+until a qualified configuration is committed. `ALLOW_UNOPTIMIZED_LIVE=true`
+is a separate explicit override. Dry-run mode allows the safe sample
+parameters and sends no orders.
 
 On the Windows host, install 64-bit Python and MetaTrader 5, copy
 `.env.example` to `.env`, set the terminal/account values and daily loss limit,
@@ -107,6 +110,18 @@ into `dist/mt5-platform-release-<commit>.zip`, and writes a release manifest.
 It excludes `.env` secrets, logs, tick CSVs, local data, and runtime folders.
 The manifest records the commit and active strategy settings without including
 credentials.
+
+## Temporary Windows cloud host
+
+`spin_up_vps.py` can create or terminate an AWS EC2 Windows Server 2022 host
+in London (`eu-west-2`) using boto3 and the standard AWS credential chain. It
+requires an existing EC2 key pair, public subnet, and security group whose only
+ingress is RDP from one operator IPv4 `/32`; it rejects broad RDP ingress.
+Install its optional dependency with `python -m pip install -r
+requirements-cloud.txt`. The script reports the instance ID and public IP but
+never prints, stores, or logs a password, access key, or private key. The TTL
+tag is informational; terminate the host with the printed `--terminate` command
+after use. Provisioning also requires active AWS credentials and permissions.
 
 ## Extracting EURUSD ticks on Windows
 

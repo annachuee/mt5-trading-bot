@@ -14,6 +14,7 @@ import signal
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from dotenv import load_dotenv
@@ -26,6 +27,21 @@ from mt5_strategy_engine import MT5StrategyEngine
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "strategy_params.json"
+
+
+class DryRunOMS:
+    """OMS-compatible sink that records intent without sending any order."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self.logger = logger
+
+    def market(self, strategy_id: str, symbol: str, side: str, volume: float,
+               **kwargs: Any) -> Any:
+        self.logger.info(
+            "DRY RUN: suppressed %s %s %s volume=%.2f client_order_id=%s",
+            strategy_id, side, symbol, volume, kwargs.get("client_order_id", ""),
+        )
+        return SimpleNamespace(status="dry_run", ticket=None, requested_volume=volume)
 
 
 def _required_env(name: str) -> str:
@@ -53,7 +69,7 @@ def _validate_config(require_optimized: bool) -> dict[str, Any]:
             raise RuntimeError(
                 "Active config has no holdout-qualified optimization metadata. "
                 "Run and review a qualifying optimizer result before production; "
-                "set REQUIRE_OPTIMIZED_CONFIG=false only for an explicitly approved exception."
+                "ALLOW_UNOPTIMIZED_LIVE=true is an explicit override."
             )
         try:
             qualified = (
@@ -83,11 +99,20 @@ def main() -> int:
     )
     logger = logging.getLogger("mt5.production")
 
-    if _required_env("TRADING_ENABLED").lower() not in {"true", "1", "yes"}:
-        raise RuntimeError("Live order submission is disabled; set TRADING_ENABLED=true to enable")
-    require_optimized = os.getenv("REQUIRE_OPTIMIZED_CONFIG", "true").strip().lower() not in {
+    trading_enabled_text = _required_env("TRADING_ENABLED").lower()
+    if trading_enabled_text not in {"true", "1", "yes", "false", "0", "no"}:
+        raise RuntimeError("TRADING_ENABLED must be true or false")
+    trading_enabled = trading_enabled_text in {"true", "1", "yes"}
+    require_optimized = os.getenv("REQUIRE_OPTIMIZED_CONFIG", "false").strip().lower() not in {
         "false", "0", "no"
     }
+    if trading_enabled and not require_optimized and os.getenv(
+        "ALLOW_UNOPTIMIZED_LIVE", "false"
+    ).strip().lower() not in {"true", "1", "yes"}:
+        raise RuntimeError(
+            "Live trading requires REQUIRE_OPTIMIZED_CONFIG=true. "
+            "ALLOW_UNOPTIMIZED_LIVE=true is an explicit override."
+        )
     config = _validate_config(require_optimized)
     symbol = str(config["symbol"])
     daily_loss_pct = float(_required_env("RISK_MAX_DAILY_LOSS_PCT"))
@@ -135,10 +160,22 @@ def main() -> int:
         account = mt5.account_info()
         if terminal is None or not terminal.connected or account is None:
             raise RuntimeError("MT5 terminal or account did not report a connected state")
+        require_demo = os.getenv("REQUIRE_DEMO_ACCOUNT", "true").strip().lower() not in {
+            "false", "0", "no"
+        }
+        if require_demo:
+            demo_mode = getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", None)
+            if demo_mode is None or int(getattr(account, "trade_mode", -1)) != int(demo_mode):
+                raise RuntimeError(
+                    "Connected MT5 account is not identified as a DEMO account; "
+                    "the production runner requires demo mode by default"
+                )
         if mt5.symbol_info(symbol) is None:
             raise RuntimeError(f"Symbol {symbol} is unavailable in the connected MT5 account")
 
-        oms = MT5OMS(mt5, strict_ioc=True)
+        oms: Any = MT5OMS(mt5, strict_ioc=True) if trading_enabled else DryRunOMS(
+            logging.getLogger("mt5.dry_run_oms")
+        )
         risk = MT5PreTradeRisk(
             mt5,
             [symbol],
@@ -152,8 +189,8 @@ def main() -> int:
             logger=logging.getLogger("mt5.strategy"),
         )
         logger.info(
-            "Starting production engine: strategy=%s symbol=%s fast=%d slow=%d "
-            "risk_fraction=%.4f",
+            "Starting %s engine: strategy=%s symbol=%s fast=%d slow=%d risk_fraction=%.4f",
+            "live" if trading_enabled else "dry-run",
             engine.strategy_id, engine.symbol, engine.fast_period,
             engine.slow_period, engine.risk_fraction,
         )

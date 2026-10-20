@@ -21,6 +21,7 @@ data/
 backtest_results/
 dist/
 logs/
+work/vps_provisioning_report.json
 *.parquet
 *.feather
 *_ticks.csv
