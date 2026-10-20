@@ -81,3 +81,11 @@ tracked.
 Historical tick files are intentionally excluded from Git. Keep data in a
 versioned object store or dataset registry and record its immutable identifier
 and checksum alongside each backtest report.
+
+## System diagnostics
+
+Run `python sys_diagnostics.py` to check Telegram `sendMessage`, Slack
+`chat.postMessage`, authenticated relay ingestion, and JSON parsing of
+`config/strategy_params.json`. Configure `OPS_RELAY_URL` in `.env`. This sends
+visible mock notifications to each configured provider and a mock error event
+through the relay; run it only when those test messages are appropriate.
