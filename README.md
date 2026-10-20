@@ -82,6 +82,17 @@ Historical tick files are intentionally excluded from Git. Keep data in a
 versioned object store or dataset registry and record its immutable identifier
 and checksum alongside each backtest report.
 
+## Extracting EURUSD ticks on Windows
+
+Run `extract_ticks.py` on the Windows host where the logged-in MT5 terminal is
+running. Install the Windows package with `py -m pip install -r
+requirements-mt5-windows.txt`, then run `py extract_ticks.py`. It requests all
+ticks for the last 180 days in daily UTC chunks and writes
+`EURUSD_ticks.csv` beside the script (the requested `outputs` directory when
+run there). The script checks that the file contains a header and data row
+before reporting success. The CSV is ignored by Git because historical ticks
+can be large; the optimizer can consume it directly.
+
 ## Grid optimization
 
 `mt5_grid_optimizer.py` reads a tick CSV/Parquet file through the Backtrader

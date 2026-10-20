@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 *.log
 *.sqlite*
+*_ticks.csv
 data/
 backtest_results/
 .venv/

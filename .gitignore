@@ -21,6 +21,7 @@ data/
 backtest_results/
 *.parquet
 *.feather
+*_ticks.csv
 *.sqlite
 *.sqlite3
 
