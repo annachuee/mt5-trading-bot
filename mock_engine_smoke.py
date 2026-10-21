@@ -5,16 +5,45 @@ This is an offline integration smoke run. It never imports or connects to MT5.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from pathlib import Path
 
+import aiohttp
 import numpy as np
+from dotenv import load_dotenv
 
 from mt5_oms import MT5OMS
 from mt5_pretrade_risk import MT5PreTradeRisk
 from mt5_strategy_engine import MT5StrategyEngine
+
+
+async def _telegram_send(token: str, chat_id: str, message: str) -> int:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        async with session.post(url, json={"chat_id": chat_id, "text": message}) as response:
+            payload = await response.json(content_type=None)
+            if response.status >= 400 or not isinstance(payload, dict) or not payload.get("ok"):
+                raise RuntimeError("Telegram sendMessage was not accepted")
+            return int(payload["result"]["message_id"])
+
+
+def notify_telegram(token: str, chat_id: str, message: str,
+                    logger: logging.Logger) -> bool:
+    try:
+        message_id = asyncio.run(_telegram_send(token, chat_id, message))
+    except Exception as exc:
+        # Never print the exception string: HTTP client errors can embed the
+        # token-bearing Bot API URL.
+        logger.error("Telegram sendMessage failed (%s)", type(exc).__name__)
+        return False
+    logger.info("Telegram sendMessage accepted chat_id=%s message_id=%d", chat_id, message_id)
+    return True
 
 
 class MockMT5:
@@ -109,11 +138,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=float, default=60.0)
     parser.add_argument("--config", default="config/strategy_params.json")
-    parser.add_argument("--log", default="backtest_results/mock_engine_smoke.log")
+    parser.add_argument("--log", default="backtest_results/vps_dry_run_audit.log")
     args = parser.parse_args()
 
-    import pathlib
-    log_path = pathlib.Path(args.log)
+    project_root = Path(__file__).resolve().parent
+    load_dotenv(project_root / "config" / ".env", override=True)
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not telegram_token or not telegram_chat_id:
+        parser.error("config/.env must contain TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID for this run")
+    if os.getenv("TRADING_ENABLED", "true").strip().lower() not in {"false", "0", "no"}:
+        parser.error("TRADING_ENABLED must be false for mock_engine_smoke.py")
+
+    log_path = Path(args.log)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         handlers=[logging.FileHandler(log_path, mode="w"), logging.StreamHandler()])
@@ -125,11 +162,55 @@ def main() -> int:
                            spread_min_samples=1, max_spread_points=20.0,
                            auto_kill_switch=False)
     engine = MT5StrategyEngine.from_config(mt5, feed, oms, risk, args.config, logger=logger)
-    logger.info("Starting offline mock engine; no live MT5 connection or broker orders")
+    logger.info("Starting offline mock engine; MT5 adapter is mocked and live order submission is disabled")
     engine.start(start_feed=True, start_risk_monitor=True)
-    deadline = time.monotonic() + args.seconds
+    run_started = time.monotonic()
+    deadline = run_started + args.seconds
+    notification_results = []
+    notification_results.append(notify_telegram(
+        telegram_token, telegram_chat_id,
+        f"MOCK DRY-RUN heartbeat started for {args.seconds:.0f}s; symbol=EURUSD; live orders disabled.",
+        logger,
+    ))
+    snapshot_deadline = time.monotonic() + 2.0
+    while time.monotonic() < snapshot_deadline and not risk.snapshot().terminal_connected:
+        time.sleep(0.05)
+    snapshot = risk.snapshot()
+    risk_ready = snapshot.terminal_connected and not snapshot.breached
+    logger.info("Risk monitor status connected=%s breached=%s equity=%s",
+                snapshot.terminal_connected, snapshot.breached, snapshot.equity)
+    notification_results.append(notify_telegram(
+        telegram_token, telegram_chat_id,
+        f"MOCK RISK GATE status={'READY' if risk_ready else 'NOT_READY'}; connected={snapshot.terminal_connected}; breached={snapshot.breached}; live orders disabled.",
+        logger,
+    ))
+    order_state = engine.last_order_state
+    if order_state is not None:
+        logger.info("Mock OMS lifecycle status=%s ticket=%s volume=%s",
+                    order_state.status, order_state.ticket, order_state.filled_volume)
+        notification_results.append(notify_telegram(
+            telegram_token, telegram_chat_id,
+            f"MOCK OMS order lifecycle status={order_state.status}; simulated ticket={order_state.ticket}; volume={order_state.filled_volume}. No broker order was sent.",
+            logger,
+        ))
+    else:
+        logger.warning("Mock strategy produced no order lifecycle during startup feed")
+        notification_results.append(notify_telegram(
+            telegram_token, telegram_chat_id,
+            "MOCK OMS notice: no order signal was produced by the deterministic feed.", logger,
+        ))
+    next_heartbeat = run_started + 30.0
     try:
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_heartbeat and now < deadline:
+                uptime = now - run_started
+                notification_results.append(notify_telegram(
+                    telegram_token, telegram_chat_id,
+                    f"MOCK DRY-RUN heartbeat uptime={uptime:.0f}s; risk_breached={risk.snapshot().breached}; live orders disabled.",
+                    logger,
+                ))
+                next_heartbeat += 30.0
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
     finally:
         engine.stop()
@@ -140,6 +221,10 @@ def main() -> int:
         return 1
     logger.info("Lifecycle verified: ATR sizing -> risk gate -> OMS filled ticket=%s",
                 engine.last_order_state.ticket)
+    logger.info("Dry-run duration %.1f seconds; Telegram API accepted %d/%d notifications",
+                args.seconds, sum(notification_results), len(notification_results))
+    if not all(notification_results) or not risk_ready:
+        return 2
     return 0
 
 

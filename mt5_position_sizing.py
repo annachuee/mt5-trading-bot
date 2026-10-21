@@ -30,6 +30,7 @@ class PositionSize:
     entry_price: float
     stop_price: float
     stop_distance: float
+    minimum_stop_points: float
     volume_min: float
     volume_max: float
     volume_step: float
@@ -46,6 +47,7 @@ def calculate_atr_position_size(
     risk_fraction: float = 0.01,
     atr_period: int = 14,
     atr_multiple: float = 1.0,
+    minimum_stop_points: float = 150.0,
     equity: Optional[float] = None,
 ) -> PositionSize:
     """Calculate a broker-valid lot size from completed M15 candles.
@@ -64,8 +66,10 @@ def calculate_atr_position_size(
         raise ValueError("side must be 'buy' or 'sell'")
     if not 0 < risk_fraction < 1:
         raise ValueError("risk_fraction must be in (0, 1)")
-    if atr_period < 1 or atr_multiple <= 0:
-        raise ValueError("atr_period and atr_multiple must be positive")
+    if atr_period < 1 or not math.isfinite(atr_multiple) or atr_multiple <= 0:
+        raise ValueError("atr_period and atr_multiple must be positive and finite")
+    if not math.isfinite(minimum_stop_points) or minimum_stop_points < 0:
+        raise ValueError("minimum_stop_points must be finite and non-negative")
 
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
@@ -97,11 +101,23 @@ def calculate_atr_position_size(
     if tick is None:
         raise PositionSizingError(f"No current tick for {symbol}: {mt5.last_error()}")
     entry_price = float(tick.ask if direction == "buy" else tick.bid)
-    stop_distance = atr * atr_multiple
+    point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+    if not math.isfinite(point) or point <= 0:
+        raise PositionSizingError(f"Invalid point size for {symbol}")
+    atr_stop_distance = atr * atr_multiple
+    minimum_stop_distance = minimum_stop_points * point
+    stop_distance = max(atr_stop_distance, minimum_stop_distance)
     raw_stop = entry_price - stop_distance if direction == "buy" else entry_price + stop_distance
     digits = int(getattr(symbol_info, "digits", 8))
     stop_price = round(raw_stop, digits)
     stop_distance = abs(entry_price - stop_price)
+    # Price precision can round the initial level inward. Extend it by broker
+    # points until the configured minimum is preserved after normalization.
+    while stop_distance + point * 1e-9 < minimum_stop_distance:
+        stop_distance += point
+        raw_stop = entry_price - stop_distance if direction == "buy" else entry_price + stop_distance
+        stop_price = round(raw_stop, digits)
+        stop_distance = abs(entry_price - stop_price)
     if entry_price <= 0 or stop_price <= 0:
         raise PositionSizingError("Calculated entry/stop price is not positive")
 
@@ -113,7 +129,13 @@ def calculate_atr_position_size(
     if not math.isfinite(loss_per_lot) or loss_per_lot <= 0:
         raise PositionSizingError(f"Could not estimate stop loss for {symbol}")
 
-    raw_volume = risk_budget / loss_per_lot
+    # Dynamic fixed-risk sizing: one-lot stop loss is obtained from the broker
+    # in the account's deposit currency (including symbol contract and FX
+    # conversion), so this is equivalent to
+    # (equity * risk_fraction) / (stop points * value per point per lot).
+    # No constant lot-size fallback is permitted if the broker calculation is
+    # unavailable or invalid; the guards above raise instead.
+    raw_volume = (float(equity) * risk_fraction) / loss_per_lot
     volume_min = float(symbol_info.volume_min)
     volume_max = float(symbol_info.volume_max)
     volume_step = float(symbol_info.volume_step)
@@ -164,6 +186,7 @@ def calculate_atr_position_size(
         entry_price=entry_price,
         stop_price=stop_price,
         stop_distance=stop_distance,
+        minimum_stop_points=float(minimum_stop_points),
         volume_min=volume_min,
         volume_max=volume_max,
         volume_step=volume_step,

@@ -182,6 +182,12 @@ def main() -> int:
             max_daily_loss_pct=daily_loss_pct,
             max_spread_points=max_spread_points,
             auto_kill_switch=True,
+            news_enabled=os.getenv("NEWS_CALENDAR_ENABLED", "true").strip().lower()
+            not in {"false", "0", "no"},
+            news_calendar_url=os.getenv("NEWS_CALENDAR_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json"),
+            news_refresh_interval=float(os.getenv("NEWS_CALENDAR_REFRESH_SECONDS", "900")),
+            news_max_age_seconds=float(os.getenv("NEWS_CALENDAR_MAX_AGE_SECONDS", "7200")),
+            news_blackout_minutes=float(os.getenv("NEWS_BLACKOUT_MINUTES", "30")),
             logger=logging.getLogger("mt5.risk"),
         )
         engine = MT5StrategyEngine.from_config(

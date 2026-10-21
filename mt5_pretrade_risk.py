@@ -9,14 +9,22 @@ sub-millisecond latency guarantee.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import statistics
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
+
+from mt5_news_calendar import (
+    DEFAULT_CALENDAR_URL,
+    CalendarUnavailable,
+    EconomicEvent,
+    fetch_weekly_calendar,
+)
 
 
 class RiskBlocked(RuntimeError):
@@ -32,6 +40,9 @@ class RiskSnapshot:
     daily_loss: Optional[float]
     breached: bool
     reasons: tuple[str, ...]
+    news_calendar_available: bool
+    news_blackout: bool
+    news_reason: Optional[str]
 
 
 class MT5PreTradeRisk:
@@ -70,6 +81,12 @@ class MT5PreTradeRisk:
         spread_min_samples: int = 10,
         quote_max_age_seconds: float = 1.0,
         auto_kill_switch: bool = True,
+        news_enabled: bool = True,
+        news_calendar_url: str = DEFAULT_CALENDAR_URL,
+        news_refresh_interval: float = 900.0,
+        news_max_age_seconds: float = 7200.0,
+        news_blackout_minutes: float = 30.0,
+        news_currencies: tuple[str, ...] = ("USD", "EUR", "GBP"),
         logger: Optional[logging.Logger] = None,
         on_breach: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -85,6 +102,10 @@ class MT5PreTradeRisk:
             raise ValueError("heartbeat age must exceed a positive interval")
         if spread_multiplier <= 1 or spread_window < 1 or spread_min_samples < 1:
             raise ValueError("invalid spread detector configuration")
+        if news_refresh_interval <= 0 or news_max_age_seconds <= 0 or news_blackout_minutes <= 0:
+            raise ValueError("news refresh, freshness, and blackout settings must be positive")
+        if not news_currencies:
+            raise ValueError("news_currencies must not be empty")
 
         self.mt5 = mt5_module
         self.symbols = tuple(dict.fromkeys(symbols))
@@ -98,12 +119,19 @@ class MT5PreTradeRisk:
         self.spread_min_samples = spread_min_samples
         self.quote_max_age_seconds = quote_max_age_seconds
         self.auto_kill_switch = auto_kill_switch
+        self.news_enabled = bool(news_enabled)
+        self.news_calendar_url = news_calendar_url
+        self.news_refresh_interval = float(news_refresh_interval)
+        self.news_max_age_seconds = float(news_max_age_seconds)
+        self.news_blackout = timedelta(minutes=float(news_blackout_minutes))
+        self.news_currencies = tuple(code.upper() for code in news_currencies)
         self.logger = logger or logging.getLogger(__name__)
         self.on_breach = on_breach
 
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._news_thread: Optional[threading.Thread] = None
         self._last_heartbeat = 0.0
         self._terminal_connected = False
         self._equity: Optional[float] = None
@@ -118,6 +146,10 @@ class MT5PreTradeRisk:
         self._spread_breaches: set[str] = set()
         self._kill_lock = threading.Lock()
         self._killed = False
+        self._news_available = not self.news_enabled
+        self._news_last_success = 0.0
+        self._news_events: tuple[EconomicEvent, ...] = ()
+        self._news_error: Optional[str] = None
 
     @property
     def baseline_equity(self) -> Optional[float]:
@@ -132,6 +164,12 @@ class MT5PreTradeRisk:
             target=self._monitor, name="mt5-pretrade-risk", daemon=True
         )
         self._thread.start()
+        if self.news_enabled and not (self._news_thread and self._news_thread.is_alive()):
+            self._news_thread = threading.Thread(
+                target=lambda: asyncio.run(self._news_refresh_loop()),
+                name="mt5-news-calendar", daemon=True,
+            )
+            self._news_thread.start()
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
@@ -139,6 +177,10 @@ class MT5PreTradeRisk:
             self._thread.join(timeout)
             if self._thread.is_alive():
                 raise TimeoutError("Risk monitor did not stop before timeout")
+        if self._news_thread:
+            self._news_thread.join(timeout)
+            if self._news_thread.is_alive():
+                raise TimeoutError("News calendar refresh did not stop before timeout")
 
     def check_order(self, symbol: str) -> None:
         """Fast, cached fail-closed check. Call immediately before OMS submit."""
@@ -153,6 +195,10 @@ class MT5PreTradeRisk:
                 reasons.append("MT5 terminal reports disconnected")
             if self._breached:
                 reasons.extend(self._breach_reasons or ("daily loss limit breached",))
+            if self.news_enabled:
+                news_reason = self._news_gate_reason_locked(datetime.now(timezone.utc), now)
+                if news_reason:
+                    reasons.append(news_reason)
             if symbol not in self._spreads:
                 reasons.append(f"no spread monitor configured for {symbol}")
             else:
@@ -180,7 +226,64 @@ class MT5PreTradeRisk:
                 daily_loss=self._daily_loss,
                 breached=self._breached,
                 reasons=self._breach_reasons,
+                news_calendar_available=(
+                    not self.news_enabled or
+                    (self._news_available and time.monotonic() - self._news_last_success
+                     <= self.news_max_age_seconds)
+                ),
+                news_blackout=bool(self.news_enabled and self._active_news_reason_locked(
+                    datetime.now(timezone.utc)
+                )),
+                news_reason=(self._news_gate_reason_locked(datetime.now(timezone.utc), time.monotonic())
+                             if self.news_enabled else None),
             )
+
+    def _news_gate_reason_locked(self, now_utc: datetime, now_monotonic: float) -> Optional[str]:
+        if not self._news_available:
+            detail = f": {self._news_error}" if self._news_error else ""
+            return f"economic calendar unavailable; entries fail closed{detail}"
+        age = now_monotonic - self._news_last_success
+        if age < 0 or age > self.news_max_age_seconds:
+            return "economic calendar is stale; entries fail closed"
+        return self._active_news_reason_locked(now_utc)
+
+    def _active_news_reason_locked(self, now_utc: datetime) -> Optional[str]:
+        for event in self._news_events:
+            start = event.release_utc - self.news_blackout
+            end = event.release_utc + self.news_blackout
+            if start <= now_utc <= end:
+                return (
+                    f"high-impact {event.currency} news blackout: {event.title} at "
+                    f"{event.release_utc.isoformat()} (UTC)"
+                )
+        return None
+
+    async def _news_refresh_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                events = await fetch_weekly_calendar(
+                    self.news_calendar_url, currencies=self.news_currencies,
+                )
+            except Exception as exc:
+                with self._lock:
+                    self._news_available = False
+                    self._news_error = str(exc)
+                self.logger.error("Economic calendar refresh failed; news gate closed: %s", exc)
+            else:
+                with self._lock:
+                    self._news_events = events
+                    self._news_available = True
+                    self._news_last_success = time.monotonic()
+                    self._news_error = None
+                self.logger.info(
+                    "Economic calendar refreshed: %d high-impact USD/EUR/GBP events",
+                    len(events),
+                )
+            try:
+                await asyncio.to_thread(self._stop.wait, self.news_refresh_interval)
+            except RuntimeError:
+                # Interpreter shutdown may dismantle the default executor.
+                return
 
     def emergency_kill_switch(self, *, reason: str = "manual emergency stop",
                               deviation: int = 50) -> dict[str, Any]:

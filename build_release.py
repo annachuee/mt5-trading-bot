@@ -108,6 +108,13 @@ def _config_summary() -> dict[str, Any]:
         "fast_period": config.get("fast_period"),
         "slow_period": config.get("slow_period"),
         "risk_fraction": config.get("risk_fraction"),
+        "minimum_stop_points": config.get("minimum_stop_points"),
+        "adx_period": config.get("adx_period"),
+        "adx_lower_threshold": config.get("adx_threshold"),
+        "adx_upper_threshold": config.get("adx_max_threshold"),
+        "risk_reward_multiple": config.get("risk_reward_multiple"),
+        "session_start_utc": config.get("session_start_utc"),
+        "session_end_utc": config.get("session_end_utc"),
         "holdout_qualified_optimization": optimized,
     }
 

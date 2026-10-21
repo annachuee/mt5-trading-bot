@@ -9,5 +9,12 @@
   "risk_fraction": 0.01,
   "atr_period": 14,
   "atr_multiple": 1.0,
-  "deviation_points": 10
+  "minimum_stop_points": 150.0,
+  "deviation_points": 10,
+  "adx_period": 14,
+  "adx_threshold": 25.0,
+  "adx_max_threshold": 55.0,
+  "session_start_utc": "12:00",
+  "session_end_utc": "17:00",
+  "risk_reward_multiple": 2.0
 }
