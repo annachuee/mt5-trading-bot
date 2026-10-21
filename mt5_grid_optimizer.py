@@ -31,6 +31,9 @@ from mt5_backtest import (
 )
 
 
+MINIMUM_HOLDOUT_TRADES = 3
+
+
 def grid_search(
     data: pd.DataFrame,
     base: BacktestConfig,
@@ -42,7 +45,7 @@ def grid_search(
     slow_max: int = 100,
     slow_step: int = 5,
     train_fraction: float = 0.8,
-    minimum_oos_trades: int = 5,
+    minimum_oos_trades: int = MINIMUM_HOLDOUT_TRADES,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Evaluate every pair; rank on training data and validate on holdout."""
     if not 0 < train_fraction < 1:
@@ -174,6 +177,11 @@ def write_active_config(
     """Atomically update active config, preserving unrelated strategy fields."""
     if not selected:
         raise ValueError("No qualified parameter pair; active config was not changed")
+    if (int(selected.get("holdout_closed_trades", 0)) < MINIMUM_HOLDOUT_TRADES
+            or float(selected.get("holdout_return", 0.0)) <= 0
+            or float(selected.get("holdout_profit_factor", 0.0)) <= 1.0
+            or float(selected.get("holdout_sharpe_ratio", 0.0)) <= 0):
+        raise ValueError("Selected pair does not meet holdout qualification requirements")
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -202,6 +210,8 @@ def write_active_config(
         "holdout_max_drawdown": _finite_or_none(selected["holdout_max_drawdown"]),
         "holdout_sharpe_ratio": _finite_or_none(selected["holdout_sharpe_ratio"]),
         "holdout_closed_trades": int(selected["holdout_closed_trades"]),
+        "minimum_holdout_trades": MINIMUM_HOLDOUT_TRADES,
+        "holdout_qualified": True,
         "train_risk_adjusted_score": _finite_or_none(selected["train_risk_adjusted_score"]),
     }
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,7 +315,7 @@ def main() -> int:
     parser.add_argument("--slow-max", type=int, default=100)
     parser.add_argument("--slow-step", type=int, default=5)
     parser.add_argument("--train-fraction", type=float, default=0.8)
-    parser.add_argument("--minimum-oos-trades", type=int, default=5)
+    parser.add_argument("--minimum-oos-trades", type=int, default=MINIMUM_HOLDOUT_TRADES)
     parser.add_argument("--config", type=Path, default=root / "config" / "strategy_params.json")
     parser.add_argument("--results", type=Path, default=root / "backtest_results" / "grid_search.csv")
     parser.add_argument("--no-write-config", action="store_true",

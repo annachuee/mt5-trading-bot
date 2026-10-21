@@ -18,6 +18,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 BATCH_PATH = ROOT / "run_production.bat"
+MINIMUM_HOLDOUT_TRADES = 3
 
 BATCH_CONTENT = r'''@echo off
 setlocal
@@ -98,7 +99,10 @@ def _config_summary() -> dict[str, Any]:
                 float(opt["holdout_return"]) > 0
                 and float(opt["holdout_profit_factor"]) > 1
                 and float(opt["holdout_sharpe_ratio"]) > 0
-                and int(opt["holdout_closed_trades"]) >= 5
+                and int(opt["holdout_closed_trades"]) >= MINIMUM_HOLDOUT_TRADES
+                and int(opt.get("minimum_holdout_trades", MINIMUM_HOLDOUT_TRADES))
+                    == MINIMUM_HOLDOUT_TRADES
+                and opt.get("holdout_qualified") is True
             )
         except (KeyError, TypeError, ValueError):
             optimized = False

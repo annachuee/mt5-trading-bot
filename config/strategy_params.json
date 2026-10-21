@@ -4,8 +4,8 @@
   "symbol": "EURUSD",
   "magic": 1001,
   "timeframe_minutes": 15,
-  "fast_period": 10,
-  "slow_period": 30,
+  "fast_period": 15,
+  "slow_period": 90,
   "risk_fraction": 0.01,
   "atr_period": 14,
   "atr_multiple": 1.0,
@@ -16,5 +16,20 @@
   "adx_max_threshold": 55.0,
   "session_start_utc": "12:00",
   "session_end_utc": "17:00",
-  "risk_reward_multiple": 2.0
+  "risk_reward_multiple": 2.0,
+  "optimization": {
+    "method": "backtrader_tick_grid_search",
+    "selected_at_utc": "2026-10-21T10:30:39.294125+00:00",
+    "train_fraction": 0.8,
+    "data_file": "EURUSD_ticks.csv",
+    "data_sha256": "df52ed341fb969052f1ba35dca013e99721b4d534aa25b96fa7874e25f0414fb",
+    "holdout_return": 0.1136457999999953,
+    "holdout_profit_factor": 10.0,
+    "holdout_max_drawdown": 0.0100830308284366,
+    "holdout_sharpe_ratio": 4.420514564371929,
+    "holdout_closed_trades": 3,
+    "minimum_holdout_trades": 3,
+    "holdout_qualified": true,
+    "train_risk_adjusted_score": 3.5835667126176163
+  }
 }

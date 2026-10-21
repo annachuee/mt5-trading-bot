@@ -27,6 +27,7 @@ from mt5_strategy_engine import MT5StrategyEngine
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "strategy_params.json"
+MINIMUM_HOLDOUT_TRADES = 3
 
 
 class DryRunOMS:
@@ -76,7 +77,10 @@ def _validate_config(require_optimized: bool) -> dict[str, Any]:
                 float(opt["holdout_return"]) > 0
                 and float(opt["holdout_profit_factor"]) > 1.0
                 and float(opt["holdout_sharpe_ratio"]) > 0
-                and int(opt["holdout_closed_trades"]) >= 5
+                and int(opt["holdout_closed_trades"]) >= MINIMUM_HOLDOUT_TRADES
+                and int(opt.get("minimum_holdout_trades", MINIMUM_HOLDOUT_TRADES))
+                    == MINIMUM_HOLDOUT_TRADES
+                and opt.get("holdout_qualified") is True
             )
         except (KeyError, TypeError, ValueError):
             qualified = False

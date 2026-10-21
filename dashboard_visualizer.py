@@ -36,8 +36,22 @@ class DashboardMT5(MockMT5):
         self.mock_positions: dict[int, dict] = {}
         self.last_closed_trade: dict | None = None
 
-    def update_quote(self, event: dict) -> None:
-        self._tick = SimpleNamespace(bid=float(event["bid"]), ask=float(event["ask"]))
+    def process_mock_tick(self, event: dict, state=None, request: dict | None = None) -> list[dict]:
+        """Mark quotes, register new fills, and enforce exits atomically per tick."""
+        with self._simulation_lock:
+            bid, ask = float(event["bid"]), float(event["ask"])
+            self._tick = SimpleNamespace(bid=bid, ask=ask)
+            if state is not None and state.status == "filled" and state.ticket is not None:
+                if state.ticket not in self.mock_positions:
+                    if not request or not all(k in request for k in ("sl", "tp")):
+                        raise ValueError("Mock fill lacks mandatory SL/TP protection levels")
+                    self.mock_positions[state.ticket] = {
+                        "ticket": int(state.ticket), "side": state.side,
+                        "entry": float(state.average_price),
+                        "volume": float(state.filled_volume),
+                        "sl": float(request["sl"]), "tp": float(request["tp"]),
+                    }
+            return self.evaluate_mock_exits(bid, ask)
 
     def floating_pnl(self, bid: float | None = None, ask: float | None = None) -> float:
         bid = float(self._tick.bid if bid is None else bid)
@@ -159,6 +173,9 @@ class PacedMockFeed:
                 before_event(event)
             if self.on_event:
                 self.on_event(event)
+            after_event = getattr(self, "after_event", None)
+            if after_event:
+                after_event(event)
             self._index += 1
             deadline += self.interval
             self._stop.wait(max(0.0, deadline - time.monotonic()))
@@ -236,7 +253,8 @@ async function poll(){try{let r=await fetch('/state',{cache:'no-store'});let s=a
         self.logger = logging.getLogger("dashboard")
         self.mt5 = DashboardMT5()
         self.feed = PacedMockFeed("EURUSD", args.interval, self.logger)
-        self.feed.before_event = self.mt5.update_quote
+        self.feed.before_event = self._before_mock_tick
+        self.feed.after_event = self._after_mock_tick
         self.oms = MT5OMS(self.mt5)
         self.risk = MT5PreTradeRisk(self.mt5, ["EURUSD"], max_daily_loss_pct=0.05,
                                      spread_min_samples=1, max_spread_points=20.0,
@@ -319,17 +337,23 @@ async function poll(){try{let r=await fetch('/state',{cache:'no-store'});let s=a
                          "last_order_status": getattr(state, "status", "idle")},
         }
 
-    def _on_mock_tick(self, event: dict) -> None:
-        """Open simulated fills and close them at their stop or target levels."""
-        bid, ask = float(event["bid"]), float(event["ask"])
-        state = self.engine.last_order_state
-        self.mt5.sync_mock_position(state, self.mt5.last_request or {})
-        for closed in self.mt5.evaluate_mock_exits(bid, ask):
+    def _log_mock_closures(self, closed: list[dict]) -> None:
+        for record in closed:
             self.logger.info(
                 "Mock position closed ticket=%s reason=%s exit=%.5f realized_pnl=%.2f equity=%.2f",
-                closed["ticket"], closed["reason"], closed["exit"], closed["pnl"],
+                record["ticket"], record["reason"], record["exit"], record["pnl"],
                 self.mt5.simulation_balance,
             )
+
+    def _before_mock_tick(self, event: dict) -> None:
+        """Close already-open mock positions before exposing the new quote."""
+        self._log_mock_closures(self.mt5.process_mock_tick(event))
+
+    def _after_mock_tick(self, event: dict) -> None:
+        """Register any fill produced on this tick and enforce its barriers."""
+        state = self.engine.last_order_state
+        closed = self.mt5.process_mock_tick(event, state, self.mt5.last_request or {})
+        self._log_mock_closures(closed)
 
     def _session_open(self, candles: list[dict]) -> bool:
         if not candles:
