@@ -129,13 +129,17 @@ def calculate_atr_position_size(
     if not math.isfinite(loss_per_lot) or loss_per_lot <= 0:
         raise PositionSizingError(f"Could not estimate stop loss for {symbol}")
 
-    # Dynamic fixed-risk sizing: one-lot stop loss is obtained from the broker
-    # in the account's deposit currency (including symbol contract and FX
-    # conversion), so this is equivalent to
-    # (equity * risk_fraction) / (stop points * value per point per lot).
+    # Broker-calculated one-lot loss includes the contract size and account
+    # currency conversion. Express it as point value so the sizing operation
+    # follows the standard compounding formula explicitly.
     # No constant lot-size fallback is permitted if the broker calculation is
     # unavailable or invalid; the guards above raise instead.
-    raw_volume = (float(equity) * risk_fraction) / loss_per_lot
+    stop_points = stop_distance / point
+    point_value_per_lot = loss_per_lot / stop_points
+    if (not math.isfinite(stop_points) or stop_points <= 0
+            or not math.isfinite(point_value_per_lot) or point_value_per_lot <= 0):
+        raise PositionSizingError(f"Could not derive point value for {symbol}")
+    raw_volume = (float(equity) * risk_fraction) / (stop_points * point_value_per_lot)
     volume_min = float(symbol_info.volume_min)
     volume_max = float(symbol_info.volume_max)
     volume_step = float(symbol_info.volume_step)

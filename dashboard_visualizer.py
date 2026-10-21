@@ -31,6 +31,61 @@ class DashboardMT5(MockMT5):
     def __init__(self) -> None:
         super().__init__()
         self.last_request: dict | None = None
+        self._simulation_lock = threading.RLock()
+        self.simulation_balance = 10000.0
+        self.mock_positions: dict[int, dict] = {}
+        self.last_closed_trade: dict | None = None
+
+    def update_quote(self, event: dict) -> None:
+        self._tick = SimpleNamespace(bid=float(event["bid"]), ask=float(event["ask"]))
+
+    def floating_pnl(self, bid: float | None = None, ask: float | None = None) -> float:
+        bid = float(self._tick.bid if bid is None else bid)
+        ask = float(self._tick.ask if ask is None else ask)
+        with self._simulation_lock:
+            total = 0.0
+            for position in self.mock_positions.values():
+                exit_price = bid if position["side"] == "buy" else ask
+                direction = 1.0 if position["side"] == "buy" else -1.0
+                total += (exit_price - position["entry"]) * direction * 100000 * position["volume"]
+            return total
+
+    def account_info(self):
+        equity = self.simulation_balance + self.floating_pnl()
+        return SimpleNamespace(equity=equity, balance=self.simulation_balance)
+
+    def sync_mock_position(self, state, request: dict) -> None:
+        if state is None or state.status != "filled" or state.ticket is None:
+            return
+        with self._simulation_lock:
+            if state.ticket not in self.mock_positions:
+                self.mock_positions[state.ticket] = {
+                    "ticket": int(state.ticket), "side": state.side,
+                    "entry": float(state.average_price),
+                    "volume": float(state.filled_volume),
+                    "sl": float(request["sl"]), "tp": float(request["tp"]),
+                }
+
+    def evaluate_mock_exits(self, bid: float, ask: float) -> list[dict]:
+        closed = []
+        with self._simulation_lock:
+            for ticket, position in list(self.mock_positions.items()):
+                side = position["side"]
+                exit_price = float(bid if side == "buy" else ask)
+                hit_sl = exit_price <= position["sl"] if side == "buy" else exit_price >= position["sl"]
+                hit_tp = exit_price >= position["tp"] if side == "buy" else exit_price <= position["tp"]
+                if not (hit_sl or hit_tp):
+                    continue
+                reason = "stop_loss" if hit_sl else "take_profit"
+                exit_price = position["sl"] if hit_sl else position["tp"]
+                direction = 1.0 if side == "buy" else -1.0
+                pnl = (exit_price - position["entry"]) * direction * 100000 * position["volume"]
+                self.simulation_balance += pnl
+                record = {**position, "exit": exit_price, "pnl": pnl, "reason": reason}
+                self.mock_positions.pop(ticket)
+                self.last_closed_trade = record
+                closed.append(record)
+        return closed
 
     def order_send(self, request):
         self.last_request = dict(request)
@@ -99,6 +154,9 @@ class PacedMockFeed:
                 "bid": close - spread / 2,
                 "ask": close + spread / 2,
             }
+            before_event = getattr(self, "before_event", None)
+            if before_event:
+                before_event(event)
             if self.on_event:
                 self.on_event(event)
             self._index += 1
@@ -178,6 +236,7 @@ async function poll(){try{let r=await fetch('/state',{cache:'no-store'});let s=a
         self.logger = logging.getLogger("dashboard")
         self.mt5 = DashboardMT5()
         self.feed = PacedMockFeed("EURUSD", args.interval, self.logger)
+        self.feed.before_event = self.mt5.update_quote
         self.oms = MT5OMS(self.mt5)
         self.risk = MT5PreTradeRisk(self.mt5, ["EURUSD"], max_daily_loss_pct=0.05,
                                      spread_min_samples=1, max_spread_points=20.0,
@@ -186,6 +245,9 @@ async function poll(){try{let r=await fetch('/state',{cache:'no-store'});let s=a
             self.mt5, self.feed, self.oms, self.risk,
             self.root_dir / "config" / "strategy_params.json", logger=self.logger,
         )
+        # The engine installs itself as the primary feed callback and chains
+        # this simulator hook after each event so exits run on every mock tick.
+        self.feed.on_event = self._on_mock_tick
         self._lock = threading.RLock()
         self.markers: list[dict] = []
         self._last_seen = None
@@ -226,10 +288,11 @@ async function poll(){try{let r=await fetch('/state',{cache:'no-store'});let s=a
         state = self.engine.last_order_state
         req = self.mt5.last_request or {}
         last_price = candles[-1]["close"] if candles else 1.1
-        entry = float(getattr(state, "average_price", 0.0) or 0.0) if state else 0.0
-        volume = float(getattr(state, "filled_volume", 0.0) or 0.0) if state else 0.0
-        side = getattr(state, "side", "buy") if state else "buy"
-        floating = (last_price - entry) * (1 if side == "buy" else -1) * 100000 * volume if entry else 0.0
+        active_values = list(self.mt5.mock_positions.values())
+        active = active_values[-1] if active_values else None
+        entry = float(active["entry"]) if active else 0.0
+        volume = float(active["volume"]) if active else 0.0
+        floating = self.mt5.floating_pnl()
         size = self.engine.last_position_size
         risk = self.risk.snapshot()
         return {
@@ -237,7 +300,7 @@ async function poll(){try{let r=await fetch('/state',{cache:'no-store'});let s=a
                          "time_label": c["time"].strftime("%d %b %H:%M UTC")} for c in candles],
             "markers": list(self.markers), "fast_period": self.engine.fast_period,
             "slow_period": self.engine.slow_period, "last_price": last_price,
-            "equity": 10000.0 + floating, "floating_pnl": floating,
+            "equity": self.mt5.simulation_balance + floating, "floating_pnl": floating,
             "risk_ready": bool(
                 risk.terminal_connected and not risk.breached
                 and risk.news_calendar_available and not risk.news_blackout
@@ -248,12 +311,25 @@ async function poll(){try{let r=await fetch('/state',{cache:'no-store'});let s=a
             "session_window": f"{self.engine.session_start_utc:%H:%M}–{self.engine.session_end_utc:%H:%M} UTC",
             "session_open": self._session_open(candles),
             "uptime": time.monotonic() - self._started,
-            "position": {"ticket": getattr(state, "ticket", None), "volume": volume,
-                         "entry": entry, "stop": float(req.get("sl", 0.0) or 0.0),
-                         "tp": float(req.get("tp", 0.0) or 0.0),
+            "position": {"ticket": active["ticket"] if active else None, "volume": volume,
+                         "entry": entry, "stop": active["sl"] if active else 0.0,
+                         "tp": active["tp"] if active else 0.0,
                          "risk_budget": getattr(size, "risk_budget", None),
-                         "estimated_loss": getattr(size, "estimated_loss", None)},
+                         "estimated_loss": getattr(size, "estimated_loss", None),
+                         "last_order_status": getattr(state, "status", "idle")},
         }
+
+    def _on_mock_tick(self, event: dict) -> None:
+        """Open simulated fills and close them at their stop or target levels."""
+        bid, ask = float(event["bid"]), float(event["ask"])
+        state = self.engine.last_order_state
+        self.mt5.sync_mock_position(state, self.mt5.last_request or {})
+        for closed in self.mt5.evaluate_mock_exits(bid, ask):
+            self.logger.info(
+                "Mock position closed ticket=%s reason=%s exit=%.5f realized_pnl=%.2f equity=%.2f",
+                closed["ticket"], closed["reason"], closed["exit"], closed["pnl"],
+                self.mt5.simulation_balance,
+            )
 
     def _session_open(self, candles: list[dict]) -> bool:
         if not candles:

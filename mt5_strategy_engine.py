@@ -21,6 +21,9 @@ from mt5_position_sizing import calculate_atr_position_size
 from mt5_pretrade_risk import RiskBlocked
 
 
+COMPOUNDING_RISK_FRACTION = 0.01
+
+
 @dataclass(frozen=True)
 class Signal:
     strategy_id: str
@@ -89,7 +92,7 @@ class MT5StrategyEngine:
         timeframe_minutes: int = 15,
         fast_period: int = 10,
         slow_period: int = 30,
-        risk_fraction: float = 0.01,
+        risk_fraction: float = COMPOUNDING_RISK_FRACTION,
         atr_period: int = 14,
         atr_multiple: float = 1.0,
         minimum_stop_points: float = 150.0,
@@ -113,6 +116,9 @@ class MT5StrategyEngine:
             raise ValueError("timeframe_minutes must be a positive divisor of 60")
         if fast_period < 1 or slow_period <= fast_period:
             raise ValueError("require 1 <= fast_period < slow_period")
+        if not math.isclose(float(risk_fraction), COMPOUNDING_RISK_FRACTION,
+                            rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("risk_fraction is fixed at exactly 0.01 (1% of current equity)")
         if adx_period < 1:
             raise ValueError("adx_period must be positive")
         if not math.isfinite(float(adx_threshold)) or adx_threshold < 0:
@@ -144,7 +150,7 @@ class MT5StrategyEngine:
         self.timeframe_minutes = timeframe_minutes
         self.fast_period = fast_period
         self.slow_period = slow_period
-        self.risk_fraction = risk_fraction
+        self.risk_fraction = COMPOUNDING_RISK_FRACTION
         self.atr_period = atr_period
         self.atr_multiple = atr_multiple
         self.minimum_stop_points = float(minimum_stop_points)
@@ -212,6 +218,9 @@ class MT5StrategyEngine:
             "deviation": config.get("deviation_points", 10),
         }
         values.update(overrides)
+        # Risk is an architectural invariant, not an operator-tunable config
+        # value. Ignore config/override drift so every order compounds at 1%.
+        values["risk_fraction"] = COMPOUNDING_RISK_FRACTION
         missing = [name for name in ("strategy_id", "magic", "symbol") if values.get(name) is None]
         if missing:
             raise ValueError(f"Missing required strategy config fields: {', '.join(missing)}")
@@ -427,6 +436,11 @@ class MT5StrategyEngine:
             tp = (size.entry_price + target_distance if signal.side == "buy"
                   else size.entry_price - target_distance)
             tp = round(tp, digits)
+            sl = round(size.stop_price, digits)
+            if signal.side == "buy" and not sl < size.entry_price < tp:
+                raise ValueError("buy protection must satisfy SL < entry < TP")
+            if signal.side == "sell" and not tp < size.entry_price < sl:
+                raise ValueError("sell protection must satisfy TP < entry < SL")
             if tp <= 0:
                 raise ValueError("Calculated take-profit price is not positive")
             self.last_take_profit = tp
@@ -441,7 +455,7 @@ class MT5StrategyEngine:
                 client_order_id=client_order_id,
                 deviation=self.deviation,
                 tp=tp,
-                sl=size.stop_price,
+                sl=sl,
                 comment=(f"{signal.reason}; risk={self.risk_fraction:.4f}; "
                          f"RR=1:{self.risk_reward_multiple:g}"),
             )
