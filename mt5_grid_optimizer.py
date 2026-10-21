@@ -72,17 +72,26 @@ def grid_search(
             "larger tick sample before optimizing."
         )
 
-    # The strategy only makes decisions on completed M15 candles. Aggregate
-    # once per split (rather than replaying 1.5m identical intra-candle ticks
-    # for each candidate); entry opens still come from the first raw tick after
-    # each candle boundary plus the configured latency.
-    train_bars = aggregate_ticks_for_m15(train, base)
-    holdout_bars = aggregate_ticks_for_m15(holdout, base)
-    print(
-        f"Prepared M15 execution bars from raw ticks: train={len(train_bars):,}, "
-        f"holdout={len(holdout_bars):,}; entries use first post-latency raw tick",
-        flush=True,
-    )
+    # Preserve native M15 OHLC ranges when the source is already candle data.
+    # Tick sources are aggregated once per split; their entry opens remain the
+    # first source tick after the next candle boundary plus configured latency.
+    if data.attrs.get("source_kind") == "m15_bars":
+        train_bars, holdout_bars = train.copy(), holdout.copy()
+        execution_resolution = "native M15 OHLC; market entries at next candle open"
+        print(
+            f"Using native M15 OHLC candles: train={len(train_bars):,}, "
+            f"holdout={len(holdout_bars):,}; entries execute at next candle open",
+            flush=True,
+        )
+    else:
+        train_bars = aggregate_ticks_for_m15(train, base)
+        holdout_bars = aggregate_ticks_for_m15(holdout, base)
+        execution_resolution = "M15 OHLC; entry from first post-latency source tick"
+        print(
+            f"Prepared M15 execution bars from raw ticks: train={len(train_bars):,}, "
+            f"holdout={len(holdout_bars):,}; entries use first post-latency raw tick",
+            flush=True,
+        )
 
     fast_values = range(fast_min, fast_max + 1, fast_step)
     slow_values = range(slow_min, slow_max + 1, slow_step)
@@ -101,7 +110,7 @@ def grid_search(
         record = {
             "fast_period": fast,
             "slow_period": slow,
-            "simulation_resolution": "M15 OHLC; entry from first post-latency source tick",
+            "simulation_resolution": execution_resolution,
             "train_return": train_result["total_return"],
             "train_profit_factor": train_result["profit_factor"],
             "train_max_drawdown": train_result["max_drawdown"],
@@ -187,7 +196,9 @@ def write_active_config(
         "data_file": data_path.name,
         "data_sha256": data_sha256,
         "holdout_return": _finite_or_none(selected["holdout_return"]),
-        "holdout_profit_factor": _finite_or_none(selected["holdout_profit_factor"]),
+        # JSON has no portable infinity literal. A capped finite value records
+        # a no-loss holdout as qualified while keeping manifests standards-safe.
+        "holdout_profit_factor": _finite_metric(selected["holdout_profit_factor"], cap=10.0),
         "holdout_max_drawdown": _finite_or_none(selected["holdout_max_drawdown"]),
         "holdout_sharpe_ratio": _finite_or_none(selected["holdout_sharpe_ratio"]),
         "holdout_closed_trades": int(selected["holdout_closed_trades"]),
@@ -209,6 +220,45 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def load_optimizer_data(path: Path, *, timestamp_col: str) -> pd.DataFrame:
+    """Load either raw ticks or native M15 OHLC without flattening candles."""
+    header = set(pd.read_csv(path, nrows=0).columns)
+    if not {"open", "high", "low", "close"}.issubset(header):
+        return load_ticks(path, timestamp_col=timestamp_col)
+
+    raw = pd.read_csv(path)
+    stamp_col = timestamp_col
+    if stamp_col not in raw.columns:
+        for fallback in ("timestamp", "datetime", "time", "DateTime"):
+            if fallback in raw.columns:
+                stamp_col = fallback
+                break
+    if stamp_col not in raw.columns:
+        raise ValueError(f"M15 candles have no recognized timestamp column: {timestamp_col!r}")
+    timestamps = pd.to_datetime(raw[stamp_col], utc=True, errors="coerce")
+    candles = raw.loc[:, ["open", "high", "low", "close"]].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    if "volume" in raw.columns:
+        candles["volume"] = pd.to_numeric(raw["volume"], errors="coerce").fillna(0.0)
+    else:
+        candles["volume"] = 0.0
+    candles.index = pd.DatetimeIndex(timestamps, name="datetime")
+    candles = candles.loc[~candles.index.isna()].sort_index()
+    candles = candles.loc[~candles.index.duplicated(keep="last")]
+    candles = candles.dropna(subset=["open", "high", "low", "close"])
+    candles.index = candles.index.tz_convert("UTC").tz_localize(None)
+    prices = candles[["open", "high", "low", "close"]]
+    if not (prices.gt(0).all().all()
+            and (candles["high"] >= prices[["open", "close"]].max(axis=1)).all()
+            and (candles["low"] <= prices[["open", "close"]].min(axis=1)).all()):
+        raise ValueError("Native OHLC data failed price and candle-boundary validation")
+    if len(candles) > 1 and not (candles.index.to_series().diff().dropna() % pd.Timedelta(minutes=15) == pd.Timedelta(0)).all():
+        raise ValueError("Native candles are not aligned to 15-minute boundaries")
+    candles.attrs["source_kind"] = "m15_bars"
+    return candles
+
+
 def _config_with_ma(base: BacktestConfig, fast: int, slow: int) -> BacktestConfig:
     values = base.__dict__.copy()
     values["fast_period"] = fast
@@ -219,6 +269,13 @@ def _config_with_ma(base: BacktestConfig, fast: int, slow: int) -> BacktestConfi
 def _finite_or_none(value: Any) -> float | None:
     value = float(value)
     return value if math.isfinite(value) else None
+
+
+def _finite_metric(value: Any, *, cap: float) -> float | None:
+    value = float(value)
+    if math.isinf(value) and value > 0:
+        return cap
+    return _finite_or_none(value)
 
 
 def main() -> int:
@@ -260,7 +317,7 @@ def main() -> int:
     if not 0 < args.risk_fraction < 1:
         parser.error("--risk-fraction must be between 0 and 1")
 
-    data = load_ticks(args.ticks, timestamp_col=args.timestamp_col)
+    data = load_optimizer_data(args.ticks, timestamp_col=args.timestamp_col)
     base = BacktestConfig(
         symbol=args.symbol, pip_size=args.pip_size, tick_size=args.tick_size,
         tick_value_loss=args.tick_value_loss, initial_cash=args.initial_cash,

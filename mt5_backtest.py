@@ -40,6 +40,14 @@ class BacktestConfig:
     risk_fraction: float = 0.01
     atr_period: int = 14
     atr_multiple: float = 1.0
+    minimum_stop_points: float = 150.0
+    adx_period: int = 14
+    adx_minimum: float = 25.0
+    adx_maximum: float = 55.0
+    session_start_utc: str = "12:00"
+    session_end_utc: str = "17:00"
+    risk_reward_multiple: float = 2.0
+    margin_per_lot: float = 1_500.0
     timeframe_minutes: int = 15
     latency_ms: int = 100
     slippage_pips: float = 0.5
@@ -93,6 +101,7 @@ class TickMACross(bt.Strategy):
         self.order: Any = None
         self.stop_order: Any = None
         self.pending_stop: Optional[tuple[str, float]] = None
+        self.take_profit_order: Any = None
         self.pending_entry_side: Optional[str] = None
         self.closed_trades = 0
         self.equity: list[float] = []
@@ -129,6 +138,12 @@ class TickMACross(bt.Strategy):
         close = float(candle["close"])
         self.closes.append(close)
         self.ranges.append((float(candle["high"]), float(candle["low"]), close))
+        range_limit = max(
+            2 * self.cfg.adx_period, self.p.slow_period + 1,
+            self.cfg.atr_period + 1,
+        )
+        if len(self.ranges) > range_limit:
+            del self.ranges[:-range_limit]
         need = max(self.p.slow_period + 1, self.cfg.atr_period + 1)
         if len(self.closes) < need or self.order is not None:
             return
@@ -147,8 +162,14 @@ class TickMACross(bt.Strategy):
         atr = self._atr()
         if atr <= 0 or not math.isfinite(atr):
             return
+        entry_time = candle["time"] + pd.Timedelta(minutes=self.cfg.timeframe_minutes)
+        adx = _calculate_adx(self.ranges, self.cfg.adx_period)
+        if (not _in_utc_session(entry_time, self.cfg)
+                or adx is None
+                or not self.cfg.adx_minimum < adx < self.cfg.adx_maximum):
+            return
         self._last_side = side
-        execute_after = candle["time"] + pd.Timedelta(minutes=self.cfg.timeframe_minutes)
+        execute_after = entry_time
         execute_after += pd.Timedelta(milliseconds=self.cfg.latency_ms)
         self.pending_signal = (execute_after, side, atr)
 
@@ -158,6 +179,9 @@ class TickMACross(bt.Strategy):
             if self.stop_order is not None:
                 self.cancel(self.stop_order)
                 self.stop_order = None
+            if self.take_profit_order is not None:
+                self.cancel(self.take_profit_order)
+                self.take_profit_order = None
             self.order = self.close()
             self.pending_signal = None
 
@@ -169,6 +193,9 @@ class TickMACross(bt.Strategy):
             return
         self.pending_signal = None
         stop_distance = atr * self.cfg.atr_multiple
+        stop_distance = max(
+            stop_distance, self.cfg.minimum_stop_points * self.cfg.tick_size
+        )
         loss_per_lot = (stop_distance / self.cfg.tick_size) * self.cfg.tick_value_loss
         if loss_per_lot <= 0 or not math.isfinite(loss_per_lot):
             return
@@ -179,10 +206,10 @@ class TickMACross(bt.Strategy):
             return
         self.pending_entry_side = side
         if side == "buy":
-            self.pending_stop = (side, price - stop_distance)
+            self.pending_stop = (side, stop_distance)
             self.order = self.buy(size=size)
         else:
-            self.pending_stop = (side, price + stop_distance)
+            self.pending_stop = (side, stop_distance)
             self.order = self.sell(size=size)
 
     def notify_order(self, order: Any) -> None:
@@ -190,23 +217,47 @@ class TickMACross(bt.Strategy):
             return
         if order.status == order.Completed:
             if self.pending_stop is not None and order.isbuy() == (self.pending_stop[0] == "buy"):
-                side, stop_price = self.pending_stop
+                side, stop_distance = self.pending_stop
+                entry_price = float(order.executed.price)
                 if side == "buy":
+                    stop_price = entry_price - stop_distance
+                    target_price = entry_price + self.cfg.risk_reward_multiple * stop_distance
                     self.stop_order = self.sell(
                         size=abs(order.executed.size), exectype=bt.Order.Stop,
                         price=stop_price,
                     )
+                    self.take_profit_order = self.sell(
+                        size=abs(order.executed.size), exectype=bt.Order.Limit,
+                        price=target_price, oco=self.stop_order,
+                    )
                 else:
+                    stop_price = entry_price + stop_distance
+                    target_price = entry_price - self.cfg.risk_reward_multiple * stop_distance
                     self.stop_order = self.buy(
                         size=abs(order.executed.size), exectype=bt.Order.Stop,
                         price=stop_price,
                     )
+                    self.take_profit_order = self.buy(
+                        size=abs(order.executed.size), exectype=bt.Order.Limit,
+                        price=target_price, oco=self.stop_order,
+                    )
                 self.pending_stop = None
-            elif self.stop_order is order:
+            elif self.stop_order is not None and order.ref == self.stop_order.ref:
                 self.stop_order = None
+            elif (self.take_profit_order is not None
+                    and order.ref == self.take_profit_order.ref):
+                self.take_profit_order = None
         elif order.status in (order.Canceled, order.Margin, order.Rejected, order.Expired):
             self.pending_stop = None
-        if order is self.order:
+            if self.stop_order is not None and order.ref == self.stop_order.ref:
+                self.stop_order = None
+            if (self.take_profit_order is not None
+                    and order.ref == self.take_profit_order.ref):
+                self.take_profit_order = None
+        # Backtrader may send a cloned order object to notifications; compare
+        # broker reference IDs so the outstanding-order guard is always
+        # released after completion/rejection.
+        if self.order is not None and order.ref == self.order.ref:
             self.order = None
 
     def notify_trade(self, trade: Any) -> None:
@@ -242,11 +293,11 @@ class TickMACross(bt.Strategy):
 
 
 class CandleMACross(bt.Strategy):
-    """M15 execution path for grid search, preserving the strategy's candle logic.
+    """M15 execution path for raw tick-derived or native OHLC candle inputs.
 
-    The optimizer pre-aggregates raw ticks into M15 OHLC bars. Market orders
-    execute at the first original tick after the next candle boundary plus the
-    configured latency. Stops use Backtrader's OHLC stop execution semantics.
+    Native candle entries execute at the following candle open; tick inputs
+    are aggregated before reaching this strategy. Stops and targets use
+    Backtrader's OHLC execution semantics.
     """
     params = (("config", None), ("fast_period", 10), ("slow_period", 30))
 
@@ -256,6 +307,7 @@ class CandleMACross(bt.Strategy):
         self.ranges: list[tuple[float, float, float]] = []
         self.order: Any = None
         self.stop_order: Any = None
+        self.take_profit_order: Any = None
         self.pending_stop: Optional[tuple[str, float]] = None
         self.closed_trades = 0
         self.equity: list[float] = []
@@ -267,6 +319,12 @@ class CandleMACross(bt.Strategy):
         close = float(self.data.close[0])
         self.closes.append(close)
         self.ranges.append((float(self.data.high[0]), float(self.data.low[0]), close))
+        range_limit = max(
+            2 * self.cfg.adx_period, self.p.slow_period + 1,
+            self.cfg.atr_period + 1,
+        )
+        if len(self.ranges) > range_limit:
+            del self.ranges[:-range_limit]
         self.equity.append(float(self.broker.getvalue()))
         self.equity_samples.append(float(self.broker.getvalue()))
         if self.order is not None or len(self.closes) < max(
@@ -284,23 +342,37 @@ class CandleMACross(bt.Strategy):
             side = "sell"
         if side is None or side == self._last_side:
             return
-        self._last_side = side
         atr = self._atr()
         if atr <= 0 or not math.isfinite(atr):
             return
+        entry_time = self.data.datetime.datetime(0) + pd.Timedelta(
+            minutes=self.cfg.timeframe_minutes
+        )
+        adx = _calculate_adx(self.ranges, self.cfg.adx_period)
+        if (not _in_utc_session(entry_time, self.cfg)
+                or adx is None
+                or not self.cfg.adx_minimum < adx < self.cfg.adx_maximum):
+            return
+        self._last_side = side
         if self.position:
             if self.stop_order is not None:
                 self.cancel(self.stop_order)
                 self.stop_order = None
+            if self.take_profit_order is not None:
+                self.cancel(self.take_profit_order)
+                self.take_profit_order = None
             self.order = self.close()
             return
-        loss_per_lot = (atr * self.cfg.atr_multiple / self.cfg.tick_size) * self.cfg.tick_value_loss
+        stop_distance = max(
+            atr * self.cfg.atr_multiple,
+            self.cfg.minimum_stop_points * self.cfg.tick_size,
+        )
+        loss_per_lot = (stop_distance / self.cfg.tick_size) * self.cfg.tick_value_loss
         raw_size = max(0.0, float(self.broker.getvalue()) * self.cfg.risk_fraction) / loss_per_lot
         size = self._quantize_size(raw_size)
         if size <= 0:
             return
-        self.pending_stop = (side, close - atr * self.cfg.atr_multiple
-                             if side == "buy" else close + atr * self.cfg.atr_multiple)
+        self.pending_stop = (side, stop_distance)
         self.order = self.buy(size=size) if side == "buy" else self.sell(size=size)
 
     def notify_order(self, order: Any) -> None:
@@ -308,19 +380,42 @@ class CandleMACross(bt.Strategy):
             return
         if order.status == order.Completed:
             if self.pending_stop is not None and order.isbuy() == (self.pending_stop[0] == "buy"):
-                side, stop_price = self.pending_stop
+                side, stop_distance = self.pending_stop
+                entry_price = float(order.executed.price)
                 if side == "buy":
+                    stop_price = entry_price - stop_distance
+                    target_price = entry_price + self.cfg.risk_reward_multiple * stop_distance
                     self.stop_order = self.sell(size=abs(order.executed.size),
                                                 exectype=bt.Order.Stop, price=stop_price)
+                    self.take_profit_order = self.sell(
+                        size=abs(order.executed.size), exectype=bt.Order.Limit,
+                        price=target_price, oco=self.stop_order,
+                    )
                 else:
+                    stop_price = entry_price + stop_distance
+                    target_price = entry_price - self.cfg.risk_reward_multiple * stop_distance
                     self.stop_order = self.buy(size=abs(order.executed.size),
                                                exectype=bt.Order.Stop, price=stop_price)
+                    self.take_profit_order = self.buy(
+                        size=abs(order.executed.size), exectype=bt.Order.Limit,
+                        price=target_price, oco=self.stop_order,
+                    )
                 self.pending_stop = None
-            elif self.stop_order is order:
+            elif self.stop_order is not None and order.ref == self.stop_order.ref:
                 self.stop_order = None
+            elif (self.take_profit_order is not None
+                    and order.ref == self.take_profit_order.ref):
+                self.take_profit_order = None
         elif order.status in (order.Canceled, order.Margin, order.Rejected, order.Expired):
             self.pending_stop = None
-        if order is self.order:
+            if self.stop_order is not None and order.ref == self.stop_order.ref:
+                self.stop_order = None
+            if (self.take_profit_order is not None
+                    and order.ref == self.take_profit_order.ref):
+                self.take_profit_order = None
+        # Notification callbacks can receive a clone rather than the exact
+        # Python object returned by buy/sell/close.
+        if self.order is not None and order.ref == self.order.ref:
             self.order = None
 
     def notify_trade(self, trade: Any) -> None:
@@ -346,6 +441,50 @@ class CandleMACross(bt.Strategy):
                            / cfg.volume_step)
         return round(cfg.volume_min + steps * cfg.volume_step,
                      max(0, len(f"{cfg.volume_step:.12f}".rstrip("0").partition(".")[2])))
+
+
+def _in_utc_session(timestamp: Any, cfg: BacktestConfig) -> bool:
+    stamp = pd.Timestamp(timestamp)
+    start_hour, start_minute = map(int, cfg.session_start_utc.split(":"))
+    end_hour, end_minute = map(int, cfg.session_end_utc.split(":"))
+    minute_of_day = stamp.hour * 60 + stamp.minute
+    return start_hour * 60 + start_minute <= minute_of_day < end_hour * 60 + end_minute
+
+
+def _calculate_adx(ranges: list[tuple[float, float, float]], period: int) -> Optional[float]:
+    """Calculate Wilder ADX for contiguous completed (high, low, close) bars."""
+    if period < 1 or len(ranges) < 2 * period:
+        return None
+    true_ranges: list[float] = []
+    plus_dm: list[float] = []
+    minus_dm: list[float] = []
+    for previous, current in zip(ranges, ranges[1:]):
+        prev_high, prev_low, prev_close = previous
+        high, low, _close = current
+        up, down = high - prev_high, prev_low - low
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    sm_tr, sm_plus, sm_minus = (sum(series[:period])
+                                for series in (true_ranges, plus_dm, minus_dm))
+    dx: list[float] = []
+    for index in range(period - 1, len(true_ranges)):
+        if index > period - 1:
+            sm_tr = sm_tr - sm_tr / period + true_ranges[index]
+            sm_plus = sm_plus - sm_plus / period + plus_dm[index]
+            sm_minus = sm_minus - sm_minus / period + minus_dm[index]
+        if sm_tr <= 0:
+            dx.append(0.0)
+            continue
+        pdi, mdi = 100 * sm_plus / sm_tr, 100 * sm_minus / sm_tr
+        total = pdi + mdi
+        dx.append(100 * abs(pdi - mdi) / total if total else 0.0)
+    if len(dx) < period:
+        return None
+    adx = sum(dx[:period]) / period
+    for value in dx[period:]:
+        adx = (adx * (period - 1) + value) / period
+    return adx
 
 
 def load_ticks(path: str | Path, *, timestamp_col: str = "time") -> pd.DataFrame:
@@ -403,6 +542,8 @@ def run_backtest(data: pd.DataFrame, config: BacktestConfig) -> dict[str, Any]:
     cerebro.broker.addcommissioninfo(VenueCommission(
         per_lot_side=config.fee_per_lot_side,
         fixed_per_order=config.fixed_fee_per_order,
+        mult=100_000.0, margin=config.margin_per_lot,
+        leverage=1.0, stocklike=False,
     ))
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
     cerebro.addanalyzer(bt.analyzers.Returns, _name="returns")
@@ -490,6 +631,8 @@ def run_candle_backtest(data: pd.DataFrame, config: BacktestConfig) -> dict[str,
     cerebro.broker.addcommissioninfo(VenueCommission(
         per_lot_side=config.fee_per_lot_side,
         fixed_per_order=config.fixed_fee_per_order,
+        mult=100_000.0, margin=config.margin_per_lot,
+        leverage=1.0, stocklike=False,
     ))
     strat = cerebro.run()[0]
     equity = np.asarray(strat.equity, dtype=float)

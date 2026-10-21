@@ -139,6 +139,11 @@ can be large; the optimizer can consume it directly.
 `mt5_grid_optimizer.py` reads a tick CSV/Parquet file through the Backtrader
 engine, evaluates fast SMA values 5–20 and slow SMA values 30–100 by default,
 and writes per-pair train/holdout metrics to `backtest_results/grid_search.csv`.
+It accepts native M15 OHLCV files without flattening their candle ranges, and
+simulates the strategy's ADX band, UTC session window, 150-point EURUSD stop
+floor, 1:2 take-profit, FX lot contract value, slippage, and commission.
+Native candle entries use the next M15 open; tick-source runs apply the
+configured post-signal latency at the first eligible source tick.
 Set the pip/tick economics, commission schedule, slippage, and latency from the
 actual instrument/account before comparing runs. Example:
 
@@ -156,6 +161,14 @@ return, Profit Factor above 1, positive Sharpe, and at least five closed trades.
 Use `--no-write-config` to inspect a run without changing the active file.
 `MT5StrategyEngine.from_config(...)` loads the resulting parameters. Review the
 config diff and commit it to preserve or roll back a chosen parameter set.
+
+When MT5 history is unavailable, run `python download_eurusd_m15.py` to fetch
+the pinned public M15 sample and atomically replace the ignored
+`EURUSD_ticks.csv`. The pinned repository sample covers 2026-03-26 through
+2026-09-25 and was cross-checked over overlapping bars against FXCM's public
+UTC minute-candle archive. Both sources are indicative and can differ from the
+broker's feed; FXCM states its public prices reflect its lowest Active Trader
+spreads. The CSV is ignored and is deliberately excluded from release bundles.
 
 ## System diagnostics
 
