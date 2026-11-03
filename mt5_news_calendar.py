@@ -22,6 +22,14 @@ class CalendarUnavailable(RuntimeError):
     """Raised when the calendar cannot be safely loaded and parsed."""
 
 
+class CalendarRateLimited(CalendarUnavailable):
+    """HTTP 429 response with an optional server-provided retry delay."""
+
+    def __init__(self, retry_after_seconds: float | None = None) -> None:
+        super().__init__("calendar HTTP 429 (rate limited)")
+        self.retry_after_seconds = retry_after_seconds
+
+
 @dataclass(frozen=True)
 class EconomicEvent:
     title: str
@@ -44,6 +52,13 @@ async def fetch_weekly_calendar(
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.get(url) as response:
+                if response.status == 429:
+                    raw_retry_after = response.headers.get("Retry-After", "")
+                    try:
+                        retry_after = max(0.0, float(raw_retry_after))
+                    except (TypeError, ValueError):
+                        retry_after = None
+                    raise CalendarRateLimited(retry_after)
                 if response.status != 200:
                     raise CalendarUnavailable(f"calendar HTTP status {response.status}")
                 payload = await response.json(content_type=None)

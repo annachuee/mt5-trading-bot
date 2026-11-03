@@ -38,7 +38,10 @@ class MT5MarketData:
         login: Optional[int] = None,
         password: Optional[str] = None,
         server: Optional[str] = None,
-        poll_interval: float = 0.05,
+        # A 150 ms interval reduces repeated IPC calls on older Windows VPS
+        # terminals while still keeping the dashboard responsive. Callers may
+        # tune this through MT5_POLL_INTERVAL_SECONDS.
+        poll_interval: float = 0.15,
         reconnect_delay: float = 2.0,
         max_reconnect_delay: float = 30.0,
         tick_batch_size: int = 1000,

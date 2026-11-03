@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import signal
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -112,6 +113,21 @@ class OpsNotifier:
         await self._enqueue("emergency_kill", {
             "reason": reason, "report": report or {},
         }, priority=0)
+
+    async def send_order_fill(self, state: Any) -> None:
+        """Queue a concise OMS execution event, including partial fills."""
+        await self._enqueue("order_fill", {
+            "strategy": str(getattr(state, "strategy_id", "unknown")),
+            "symbol": str(getattr(state, "symbol", "unknown")),
+            "side": str(getattr(state, "side", "unknown")),
+            "status": str(getattr(state, "status", "unknown")),
+            "ticket": getattr(state, "ticket", None),
+            "volume": float(getattr(state, "filled_volume", 0.0)),
+            "price": getattr(state, "average_price", None),
+        }, priority=5)
+
+    async def send_risk_alert(self, reason: str) -> None:
+        await self._enqueue("risk_alert", {"reason": str(reason)}, priority=5)
 
     async def publish_mt5_pnl(self, mt5: Any, *, symbol: str = "ACCOUNT",
                               strategy: Optional[str] = None,
@@ -257,6 +273,82 @@ def bind_risk_breach_notifications(risk_engine: Any, notifier: OpsNotifier,
     risk_engine.on_breach = on_breach
 
 
+class NotificationBridge:
+    """Thread-safe sync bridge from MT5 callbacks to the async notifier.
+
+    Telegram is optional at startup: missing credentials disable notifications
+    with a warning instead of preventing the demo engine/dashboard from starting.
+    """
+
+    def __init__(self, settings: Optional[WebhookSettings] = None,
+                 logger: Optional[logging.Logger] = None) -> None:
+        self.settings = settings or WebhookSettings.from_env()
+        self.logger = logger or logging.getLogger(__name__)
+        self.enabled = self.settings.has_destination
+        self._ready = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._notifier: Optional[OpsNotifier] = None
+        if not self.enabled:
+            self.logger.warning("Notifications disabled: no complete Telegram/Slack destination configured")
+
+    def start(self) -> None:
+        if not self.enabled or (self._thread and self._thread.is_alive()):
+            return
+        self._thread = threading.Thread(target=self._run, name="notification-dispatcher", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=10.0):
+            raise TimeoutError("Notification dispatcher failed to initialize")
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._notifier = OpsNotifier(self.settings, logger=self.logger)
+        try:
+            loop.run_until_complete(self._notifier.start())
+            self._ready.set()
+            loop.run_forever()
+        finally:
+            if self._notifier is not None:
+                loop.run_until_complete(self._notifier.close())
+            loop.close()
+
+    def _schedule(self, coroutine: Any) -> None:
+        if not self.enabled:
+            return
+        if self._loop is None or not self._ready.is_set():
+            self.logger.warning("Notification event skipped: dispatcher is not ready")
+            return
+        asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+
+    def order_update(self, state: Any) -> None:
+        self._schedule(self._notifier.send_order_fill(state))
+
+    def risk_breach(self, reason: str) -> None:
+        self._schedule(self._notifier.send_kill(reason=reason, report={"source": "automatic risk breach"}))
+
+    def risk_gate_block(self, reason: str) -> None:
+        self._schedule(self._notifier.send_risk_alert(reason))
+
+    def error(self, message: str, *, component: str = "platform") -> None:
+        self._schedule(self._notifier.send_error(message, component=component))
+
+    def pnl(self, mt5: Any, *, symbol: str, strategy: str) -> None:
+        async def publish() -> None:
+            await self._notifier.publish_mt5_pnl(mt5, symbol=symbol, strategy=strategy)
+        self._schedule(publish())
+
+    def close(self, timeout: float = 5.0) -> None:
+        if not self.enabled or self._loop is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(self._notifier.close(), self._loop)
+        future.result(timeout=timeout)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+
 async def pnl_report_loop(mt5: Any, notifier: OpsNotifier, *, interval_seconds: float = 5.0,
                           symbol: str = "ACCOUNT", strategy: Optional[str] = None,
                           daily_pnl_provider: Optional[Any] = None) -> None:
@@ -368,7 +460,8 @@ async def _run_relay() -> None:
 
 
 def _format_event(event: dict[str, Any]) -> str:
-    titles = {"pnl": "LIVE P&L", "error": "PLATFORM ERROR", "emergency_kill": "EMERGENCY KILL"}
+    titles = {"pnl": "LIVE P&L", "error": "PLATFORM ERROR", "emergency_kill": "EMERGENCY KILL",
+              "order_fill": "MT5 ORDER FILL", "risk_alert": "RISK GATE BLOCK"}
     payload = json.dumps(event["payload"], ensure_ascii=False, sort_keys=True)
     return f"{titles.get(event['event_type'], event['event_type'])}\n{event['timestamp']}\n{payload}"[:4000]
 

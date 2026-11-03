@@ -93,6 +93,8 @@ class MT5OMS:
         self._ticket_owner: dict[int, tuple[str, str]] = {}
         self.positions: dict[int, PositionProtectionState] = {}
         self._atr_cache: dict[tuple[str, int], tuple[int, float]] = {}
+        # Optional observer; notification failures must never alter execution.
+        self.on_order_update: Optional[Any] = None
 
     def market(
         self, strategy_id: str, symbol: str, side: str, volume: float, *,
@@ -554,6 +556,16 @@ class MT5OMS:
             with self._lock:
                 self._ticket_owner[state.ticket] = (state.strategy_id, state.client_order_id)
         self._touch(state)
+        if state.status in {"filled", "partial", "partial_canceled"}:
+            callback = self.on_order_update
+            if callable(callback):
+                try:
+                    callback(state)
+                except Exception:
+                    # An observer (for example Telegram) must not change the
+                    # result of a broker execution.
+                    import logging
+                    logging.getLogger(__name__).exception("OMS order observer failed")
         if state.status == "rejected":
             raise OMSException(f"MT5 rejected order ({state.retcode}): {state.comment}")
         return state

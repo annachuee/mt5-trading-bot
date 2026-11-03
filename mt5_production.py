@@ -13,6 +13,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,11 +24,13 @@ from mt5_market_data import MT5MarketData
 from mt5_oms import MT5OMS
 from mt5_pretrade_risk import MT5PreTradeRisk
 from mt5_strategy_engine import MT5StrategyEngine
+from mt5_ops_webhooks import NotificationBridge
 
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "strategy_params.json"
 MINIMUM_HOLDOUT_TRADES = 3
+DEFAULT_DASHBOARD_OUTPUT_DIR = Path(os.path.dirname(__file__)).resolve()
 
 
 class DryRunOMS:
@@ -127,14 +130,16 @@ def main() -> int:
     if max_spread_points is not None and max_spread_points <= 0:
         raise RuntimeError("RISK_MAX_SPREAD_POINTS must be positive")
 
-    terminal_path = _required_env("MT5_TERMINAL_PATH")
-    login_text = _required_env("MT5_LOGIN")
+    terminal_path = os.getenv("MT5_TERMINAL_PATH", "").strip() or None
+    login_text = os.getenv("MT5_LOGIN", "").strip()
     try:
-        login = int(login_text)
+        login = int(login_text) if login_text else None
     except ValueError as exc:
-        raise RuntimeError("MT5_LOGIN must be a numeric account login") from exc
-    password = _required_env("MT5_PASSWORD")
-    server = _required_env("MT5_SERVER")
+        raise RuntimeError("MT5_LOGIN must be a numeric account login when provided") from exc
+    # Omit credentials to use the already logged-in terminal session. The
+    # account is still checked against MetaTrader's DEMO trade mode below.
+    password = os.getenv("MT5_PASSWORD", "").strip() or None
+    server = os.getenv("MT5_SERVER", "").strip() or None
 
     feed = MT5MarketData(
         symbol,
@@ -142,11 +147,14 @@ def main() -> int:
         login=login,
         password=password,
         server=server,
-        poll_interval=float(os.getenv("MT5_POLL_INTERVAL_SECONDS", "0.05")),
-        reconnect_delay=float(os.getenv("MT5_RECONNECT_DELAY_SECONDS", "2")),
+        poll_interval=float(os.getenv("MT5_POLL_INTERVAL_SECONDS", "0.15")),
+        reconnect_delay=float(os.getenv("MT5_RECONNECT_DELAY_SECONDS", "5")),
     )
     risk: MT5PreTradeRisk | None = None
     engine: MT5StrategyEngine | None = None
+    dashboard_writer: Any = None
+    notifier = NotificationBridge(logger=logging.getLogger("mt5.notifications"))
+    notifier.start()
     stopped = threading.Event()
 
     def request_stop(_signum: int, _frame: Any) -> None:
@@ -167,6 +175,8 @@ def main() -> int:
         require_demo = os.getenv("REQUIRE_DEMO_ACCOUNT", "true").strip().lower() not in {
             "false", "0", "no"
         }
+        if trading_enabled and not require_demo:
+            raise RuntimeError("Order routing requires REQUIRE_DEMO_ACCOUNT=true")
         if require_demo:
             demo_mode = getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", None)
             if demo_mode is None or int(getattr(account, "trade_mode", -1)) != int(demo_mode):
@@ -180,6 +190,8 @@ def main() -> int:
         oms: Any = MT5OMS(mt5, strict_ioc=True) if trading_enabled else DryRunOMS(
             logging.getLogger("mt5.dry_run_oms")
         )
+        if isinstance(oms, MT5OMS):
+            oms.on_order_update = notifier.order_update
         risk = MT5PreTradeRisk(
             mt5,
             [symbol],
@@ -190,13 +202,21 @@ def main() -> int:
             not in {"false", "0", "no"},
             news_calendar_url=os.getenv("NEWS_CALENDAR_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json"),
             news_refresh_interval=float(os.getenv("NEWS_CALENDAR_REFRESH_SECONDS", "900")),
-            news_max_age_seconds=float(os.getenv("NEWS_CALENDAR_MAX_AGE_SECONDS", "7200")),
+        news_max_age_seconds=float(os.getenv("NEWS_CALENDAR_MAX_AGE_SECONDS", "7200")),
             news_blackout_minutes=float(os.getenv("NEWS_BLACKOUT_MINUTES", "30")),
             logger=logging.getLogger("mt5.risk"),
+            on_breach=notifier.risk_breach,
+            on_gate_block=notifier.risk_gate_block,
         )
         engine = MT5StrategyEngine.from_config(
             mt5, feed, oms, risk, CONFIG_PATH,
             logger=logging.getLogger("mt5.strategy"),
+        )
+        from dashboard_visualizer import StaticDashboardWriter
+        dashboard_writer = StaticDashboardWriter(
+            feed, engine, risk, mt5, trading_enabled=trading_enabled,
+            symbol=symbol, output_dir=DEFAULT_DASHBOARD_OUTPUT_DIR,
+            logger=logging.getLogger("mt5.dashboard"),
         )
         logger.info(
             "Starting %s engine: strategy=%s symbol=%s fast=%d slow=%d risk_fraction=%.4f",
@@ -204,16 +224,58 @@ def main() -> int:
             engine.strategy_id, engine.symbol, engine.fast_period,
             engine.slow_period, engine.risk_fraction,
         )
-        engine.start(start_feed=True, start_risk_monitor=True)
-        while not stopped.wait(1.0):
+        # Calendar throttling is isolated in MT5PreTradeRisk's worker. Static
+        # dashboard writes use no HTTP listener and cannot block feed startup.
+        try:
+            risk.start()
+        except Exception:
+            logger.exception(
+                "Risk monitor startup failed; keeping feed/dashboard running; "
+                "order gates will block entries until risk state is healthy"
+            )
+        engine.start(start_feed=True, start_risk_monitor=False)
+        dashboard_interval = float(os.getenv("DASHBOARD_PUBLISH_INTERVAL_SECONDS", "1"))
+        if dashboard_interval <= 0:
+            raise RuntimeError("DASHBOARD_PUBLISH_INTERVAL_SECONDS must be positive")
+        try:
+            dashboard_writer.write_snapshot()
+            logger.info("Static dashboard output directory: %s", dashboard_writer.output_dir)
+            logger.info("Static dashboard snapshot: %s", dashboard_writer.html_path)
+        except Exception:
+            logger.exception(
+                "Initial dashboard snapshot failed at %s; production engine continues",
+                dashboard_writer.output_dir,
+            )
+        last_pnl_notice = 0.0
+        last_dashboard_write = time.monotonic()
+        while not stopped.wait(min(1.0, dashboard_interval)):
             if not feed.connected:
                 logger.warning("Market data feed is reconnecting; risk gate will fail closed")
+            now = time.monotonic()
+            if now - last_dashboard_write >= dashboard_interval:
+                try:
+                    dashboard_writer.write_snapshot()
+                except Exception:
+                    logger.exception(
+                        "Dashboard snapshot write failed at %s; production engine continues",
+                        dashboard_writer.output_dir,
+                    )
+                last_dashboard_write = now
+            if notifier.enabled and now - last_pnl_notice >= float(
+                os.getenv("TELEGRAM_PNL_INTERVAL_SECONDS", "60")
+            ):
+                notifier.pnl(mt5, symbol=symbol, strategy=engine.strategy_id)
+                last_pnl_notice = now
     finally:
         if engine is not None:
             engine.stop()
         if risk is not None:
             risk.stop()
         feed.stop()
+        try:
+            notifier.close()
+        except Exception:
+            logger.exception("Notification dispatcher shutdown failed")
         logger.info("Production engine stopped")
     return 0
 

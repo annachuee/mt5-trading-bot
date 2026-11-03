@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 
 from mt5_news_calendar import (
     DEFAULT_CALENDAR_URL,
+    CalendarRateLimited,
     CalendarUnavailable,
     EconomicEvent,
     fetch_weekly_calendar,
@@ -89,6 +90,7 @@ class MT5PreTradeRisk:
         news_currencies: tuple[str, ...] = ("USD", "EUR", "GBP"),
         logger: Optional[logging.Logger] = None,
         on_breach: Optional[Callable[[str], None]] = None,
+        on_gate_block: Optional[Callable[[str], None]] = None,
     ) -> None:
         if not symbols:
             raise ValueError("at least one symbol is required")
@@ -127,6 +129,8 @@ class MT5PreTradeRisk:
         self.news_currencies = tuple(code.upper() for code in news_currencies)
         self.logger = logger or logging.getLogger(__name__)
         self.on_breach = on_breach
+        self.on_gate_block = on_gate_block
+        self._last_gate_alert: tuple[str, float] | None = None
 
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -216,6 +220,22 @@ class MT5PreTradeRisk:
         self.check_order(symbol)
         return oms_callable(*args, **kwargs)
 
+    def report_gate_block(self, reason: str) -> None:
+        """Report a blocked strategy entry, rate-limited per reason."""
+        callback = self.on_gate_block
+        if callback is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            previous = self._last_gate_alert
+            if previous and previous[0] == reason and now - previous[1] < 60.0:
+                return
+            self._last_gate_alert = (reason, now)
+        try:
+            callback(reason)
+        except Exception:
+            self.logger.exception("Risk-gate notification callback failed")
+
     def snapshot(self) -> RiskSnapshot:
         with self._lock:
             return RiskSnapshot(
@@ -260,15 +280,43 @@ class MT5PreTradeRisk:
 
     async def _news_refresh_loop(self) -> None:
         while not self._stop.is_set():
+            retry_delay = self.news_refresh_interval
             try:
                 events = await fetch_weekly_calendar(
                     self.news_calendar_url, currencies=self.news_currencies,
                 )
+            except CalendarRateLimited as exc:
+                now = time.monotonic()
+                with self._lock:
+                    cache_age = now - self._news_last_success
+                    cache_is_fresh = (
+                        self._news_last_success > 0
+                        and 0 <= cache_age <= self.news_max_age_seconds
+                    )
+                    # A recent successful calendar remains authoritative
+                    # through a transient 429. Once it ages out, fail closed.
+                    self._news_available = cache_is_fresh
+                    self._news_error = "HTTP 429 rate limit"
+                self.logger.warning(
+                    "Economic calendar returned HTTP 429; keeping fresh cached events "
+                    "until their age limit, then closing the news gate"
+                )
+                server_delay = exc.retry_after_seconds
+                if server_delay is not None:
+                    retry_delay = max(
+                        self.news_refresh_interval,
+                        min(float(server_delay), 3600.0),
+                    )
+                if not cache_is_fresh:
+                    self.report_gate_block(
+                        "Economic calendar rate limited and no fresh cached calendar is available"
+                    )
             except Exception as exc:
                 with self._lock:
                     self._news_available = False
                     self._news_error = str(exc)
                 self.logger.error("Economic calendar refresh failed; news gate closed: %s", exc)
+                self.report_gate_block(f"Economic calendar unavailable; entries fail closed: {exc}")
             else:
                 with self._lock:
                     self._news_events = events
@@ -280,7 +328,7 @@ class MT5PreTradeRisk:
                     len(events),
                 )
             try:
-                await asyncio.to_thread(self._stop.wait, self.news_refresh_interval)
+                await asyncio.to_thread(self._stop.wait, retry_delay)
             except RuntimeError:
                 # Interpreter shutdown may dismantle the default executor.
                 return

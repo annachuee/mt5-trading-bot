@@ -169,6 +169,7 @@ class MT5StrategyEngine:
         self._adx_bars: deque[tuple[float, float, float]] = deque(
             maxlen=max(2 * self.adx_period, self.slow_period + 1)
         )
+        self._closed_candles: deque[dict[str, Any]] = deque(maxlen=500)
         self._candle: Optional[_Candle] = None
         self._last_cross: Optional[str] = None
         self._sequence = 0
@@ -326,6 +327,7 @@ class MT5StrategyEngine:
             if getattr(self, "_last_candle_time", None) is not None and stamp <= self._last_candle_time:
                 return None
             self._last_candle_time = stamp
+            self._closed_candles.append({**candle, "time": stamp})
             try:
                 high = float(candle["high"])
                 low = float(candle["low"])
@@ -467,6 +469,9 @@ class MT5StrategyEngine:
             return result
         except RiskBlocked as exc:
             self.logger.warning("Signal blocked by risk gate: %s", exc)
+            report_block = getattr(self.risk_engine, "report_gate_block", None)
+            if callable(report_block):
+                report_block(str(exc))
             return None
         except Exception:
             # A failed size/gate/OMS step does not submit a fallback order.
@@ -476,6 +481,12 @@ class MT5StrategyEngine:
     def _floor_time(self, ts: datetime) -> datetime:
         minute = (ts.minute // self.timeframe_minutes) * self.timeframe_minutes
         return ts.replace(minute=minute, second=0, microsecond=0)
+
+    @property
+    def closed_candles(self) -> list[dict[str, Any]]:
+        """Return a snapshot of completed live candles for read-only telemetry."""
+        with self._lock:
+            return [dict(candle) for candle in self._closed_candles]
 
     def start(self, *, start_feed: bool = True, start_risk_monitor: bool = True) -> None:
         """Attach callbacks, start risk monitoring, then start the data feed."""
